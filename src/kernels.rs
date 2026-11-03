@@ -142,6 +142,83 @@ kernel void qmm(const device half* x [[buffer(0)]], const device float* xoff [[b
 }
 "#;
 
+/// Prompt-reading variant of QMM: each threadgroup takes RB 8-row tiles (grid y) and decodes every weight fragment
+/// once for all of them, instead of once per tile. Per row the sums run in the same order as QMM's.
+/// Defines: M, K, N, NT, SK, RB, ADD.
+pub const QMM_BIG: &str = r#"
+kernel void qmm_big(const device half* x [[buffer(0)]], const device float* xoff [[buffer(1)]], const device float* xs [[buffer(2)]],
+                const device uint2* wq [[buffer(3)]], const device bfloat* sp [[buffer(4)]], const device bfloat* bp [[buffer(5)]],
+                device float* out [[buffer(6)]],
+                uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                uint2 tg [[threadgroup_position_in_grid]]) {
+    const int NGRP = K / 64;
+    const int t0 = int(tg.x) * NT;
+    const int r0 = int(tg.y) * RB * 8;
+    const ushort qid = ushort(lane) / 4;
+    const ushort fm = (qid & 4) + ((ushort(lane) / 2) % 4);
+    const ushort fn = (qid & 2) * 2 + (ushort(lane) % 2) * 2;
+    threadgroup float part[SK][RB * 8][NT * 8];
+    threadgroup half Bs[SK][64][NT * 8];
+    simdgroup_float8x8 C[RB][NT];
+    _Pragma("unroll") for (int rb = 0; rb < RB; rb++) _Pragma("unroll") for (int nt = 0; nt < NT; nt++) C[rb][nt] = simdgroup_float8x8(0);
+    for (int g = int(sg); g < NGRP; g += SK) {
+        // decode this group's weights once into threadgroup memory (this simdgroup's own slice), shared by all RB tiles
+        _Pragma("unroll") for (int nt = 0; nt < NT; nt++) {
+            uint2 wv = wq[((t0 + nt) * NGRP + g) * 32 + lane];
+            _Pragma("unroll") for (int ks = 0; ks < 8; ks++) {
+                uint w = (ks < 4) ? wv.x : wv.y;
+                const int j = ks & 3;
+                if (j >= 2) w = w >> 8;
+                uint bits = (j & 1) ? ((w & 0x00F000F0u) | 0x54005400u) : ((w & 0x000F000Fu) | 0x64006400u);
+                half2 hv = as_type<half2>(bits);
+                Bs[sg][ks * 8 + fm][nt * 8 + fn] = hv.x;
+                Bs[sg][ks * 8 + fm][nt * 8 + fn + 1] = hv.y;
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        float s0[NT], s1[NT], b0[NT], b1[NT];
+        _Pragma("unroll") for (int nt = 0; nt < NT; nt++) {
+            int o = ((t0 + nt) * NGRP + g) * 8 + fn;
+            s0[nt] = float(sp[o]); s1[nt] = float(sp[o + 1]); b0[nt] = float(bp[o]); b1[nt] = float(bp[o + 1]);
+        }
+        _Pragma("unroll") for (int rb = 0; rb < RB; rb++) {
+            const device half* xt = x + (r0 + rb * 8) * K;
+            simdgroup_float8x8 T[NT];
+            _Pragma("unroll") for (int nt = 0; nt < NT; nt++) T[nt] = simdgroup_float8x8(0);
+            _Pragma("unroll") for (int ks = 0; ks < 8; ks++) {
+                simdgroup_half8x8 A;
+                simdgroup_load(A, xt + g * 64 + ks * 8, K);
+                _Pragma("unroll") for (int nt = 0; nt < NT; nt++) {
+                    simdgroup_half8x8 Bf;
+                    simdgroup_load(Bf, &Bs[sg][ks * 8][nt * 8], NT * 8);
+                    simdgroup_multiply_accumulate(T[nt], A, Bf, T[nt]);
+                }
+            }
+            int m = r0 + rb * 8 + fm;
+            float xo_ = xoff[m * NGRP + g], xsum = xs[m * NGRP + g];
+            _Pragma("unroll") for (int nt = 0; nt < NT; nt++) {
+                C[rb][nt].thread_elements()[0] += s0[nt] * (T[nt].thread_elements()[0] - xo_) + b0[nt] * xsum;
+                C[rb][nt].thread_elements()[1] += s1[nt] * (T[nt].thread_elements()[1] - xo_) + b1[nt] * xsum;
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    _Pragma("unroll") for (int rb = 0; rb < RB; rb++) _Pragma("unroll") for (int nt = 0; nt < NT; nt++)
+        simdgroup_store(C[rb][nt], &part[sg][rb * 8][nt * 8], NT * 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = int(sg * 32 + lane); i < RB * 8 * NT * 8; i += SK * 32) {
+        int r = i / (NT * 8), nn = i % (NT * 8);
+        float v = 0.0f;
+        for (int q = 0; q < SK; q++) v += part[q][r][nn];
+        int m = r0 + r;
+        if (m < M) {
+            if (ADD) out[m * N + t0 * 8 + nn] += v;
+            else out[m * N + t0 * 8 + nn] = v;
+        }
+    }
+}
+"#;
+
 /// Per (row, head): RMSNorm of q / k heads, RoPE (non-traditional) at the row's position, q scaled; k and v written to
 /// the memory at slot P + row. qkv row = [q (H*HD) | k (KVH*HD) | v (KVH*HD)]. One simdgroup per (row, head) over
 /// H + KVH heads. Defines: H, KVH, HD, S, EPS, THETA, SCALE.

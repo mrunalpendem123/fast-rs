@@ -554,6 +554,17 @@ impl Model {
         if rows > 128 {
             bail!("qmm rows > 128");
         }
+        let rb: usize = std::env::var("QMM_RB").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if rb > 0 && rows >= 8 * rb && rows % (8 * rb) == 0 && r0 == 0 {
+            let nt2: usize = std::env::var("QMM_NT").ok().and_then(|v| v.parse().ok()).unwrap_or(nt);
+            let sk2: usize = std::env::var("QMM_SK").ok().and_then(|v| v.parse().ok()).unwrap_or(sk);
+            let p = self.gpu.pipe("qmm_big", kernels::QMM_BIG, &[("M", rows.to_string()), ("K", w.k.to_string()), ("N", w.n.to_string()),
+                ("NT", nt2.to_string()), ("SK", sk2.to_string()), ("RB", rb.to_string()), ("ADD", (add as i32).to_string())])?;
+            e.setComputePipelineState(&p);
+            bind(e, &[x[0], x[1], x[2], &w.wq, &w.sp, &w.bp, out]);
+            e.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: w.n / (8 * nt2), height: rows / (8 * rb), depth: 1 }, sz(32 * sk2));
+            return Ok(());
+        }
         let mt = rows / 8;
         let p = self.gpu.pipe("qmm", kernels::QMM, &[("M", rows.to_string()), ("MT", mt.to_string()), ("K", w.k.to_string()),
             ("N", w.n.to_string()), ("NT", nt.to_string()), ("SK", sk.to_string()), ("ADD", (add as i32).to_string())])?;
@@ -1015,8 +1026,12 @@ fn main() -> Result<()> {
         let head = unsafe { &*(&m.head as *const QW) };
         for (name, w) in [("qkv", &l0.qkv), ("o", &l0.o), ("gate+up", &l0.gu), ("down", &l0.down), ("head", head)] {
             let mut line = format!("{name:8} N={:6} K={:5}", w.n, w.k);
-            for rows in [8usize, 16] {
-                let (xh, xo, xs, out) = (m.xh.clone(), m.xo.clone(), m.xs.clone(), m.logits.clone());
+            for rows in [8usize, 16, 128] {
+                if rows > 16 && name == "head" {
+                    continue;
+                }
+                let (xh, xo, xs) = (m.xh.clone(), m.xo.clone(), m.xs.clone());
+                let out = m.gpu.buf(rows * w.n * 4);
                 let mut best = f64::MAX;
                 for _ in 0..3 {
                     let cb = m.gpu.queue.commandBuffer().unwrap();
@@ -1030,10 +1045,22 @@ fn main() -> Result<()> {
                     best = best.min((cb.GPUEndTime() - cb.GPUStartTime()) / 20.0);
                 }
                 let gbs = (w.n * w.k / 2 + w.n * w.k / 64 * 4) as f64 / best / 1e9;
-                line += &format!(" | {rows} rows {:7.1} us {:5.1} GB/s", best * 1e6, gbs);
+                line += &format!(" | {rows} rows {:7.1} us {:5.1} GB/s {:4.2} TFLOP/s", best * 1e6, gbs, 2.0 * (rows * w.n * w.k) as f64 / best / 1e12);
             }
             println!("{line}");
         }
+        // whole prompt reading: 512 tokens, GPU time
+        let ids: Vec<i32> = (0..512).map(|i| 1000 + (i * 37 % 5000) as i32).collect();
+        m.reset();
+        m.feed(&ids[..128])?;
+        let mut v = Vec::new();
+        for _ in 0..3 {
+            m.reset();
+            let t = Instant::now();
+            m.feed(&ids)?;
+            v.push(512.0 / t.elapsed().as_secs_f64());
+        }
+        println!("prompt reading, 512 tokens: {v:.1?} tokens/s");
         return Ok(());
     }
     let eos: Vec<i32> = prompts["eos"].as_array().unwrap().iter().map(|x| x.as_i64().unwrap() as i32).collect();
