@@ -87,7 +87,7 @@ fn load(e: &Entry) -> Result<Loaded> {
             eos.push(id as i32);
         }
     }
-    let mut m = Model::load(&e.model, e.guesser.as_deref(), 4096)?;
+    let mut m = Model::load(&e.model, e.guesser.as_deref(), ctx())?;
     let t1 = Instant::now();
     m.autotune()?;
     let t2 = Instant::now();
@@ -96,9 +96,15 @@ fn load(e: &Entry) -> Result<Loaded> {
     m.generate(&warm, 8, &eos, budget(), &mut |_| true)?;
     m.reuse = true; // follow-up messages keep the memory of the conversation so far (exact: same words as rereading it)
     m.turn_tok = ["<|im_start|>", "<|turn>", "<start_of_turn>"].iter().find_map(|t| tok.token_to_id(t)).map(|x| x as i32);
-    eprintln!("loaded {} in {:.1}s (weights {:.1}s, tune {:.1}s, warm-up {:.1}s)", e.id, t0.elapsed().as_secs_f64(),
-              (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), t2.elapsed().as_secs_f64());
+    eprintln!("loaded {} in {:.1}s (weights {:.1}s, tune {:.1}s, warm-up {:.1}s), {} words of context, GPU memory {:.2} GB", e.id,
+              t0.elapsed().as_secs_f64(), (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), t2.elapsed().as_secs_f64(), ctx(),
+              m.gpu_bytes() as f64 / 1e9);
     Ok(Loaded { id: e.id.clone(), tok, env, eos, m })
+}
+
+/// Words of conversation the engine keeps in memory (question + history + answer). FAST_CTX overrides.
+fn ctx() -> usize {
+    std::env::var("FAST_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(8192)
 }
 
 fn budget() -> usize {
@@ -123,9 +129,17 @@ fn engine(entries: Vec<Entry>, rx: Receiver<Job>, ready: Sender<String>, status:
                 }
             }
             let l = cur.as_mut().context("no model loaded")?;
-            let text = render(&l.env, &job.messages)?;
-            let ids: Vec<i32> = l.tok.encode(text, false).map_err(|e| anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
-            let max = job.max.min(4096usize.saturating_sub(ids.len() + 32));
+            // long chats: drop the oldest turns (keeping any system message) until the prompt leaves room to answer
+            let mut msgs = job.messages.clone();
+            let ids: Vec<i32> = loop {
+                let text = render(&l.env, &msgs)?;
+                let ids: Vec<i32> = l.tok.encode(text, false).map_err(|e| anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
+                let first = msgs.iter().position(|m| m["role"] != "system").unwrap_or(0);
+                if ids.len() + 1024 <= ctx() || msgs.len() - first <= 1 { break ids; }
+                msgs.remove(first);
+            };
+            anyhow::ensure!(ids.len() + 64 < ctx(), "the message is too long for this model's memory ({} words)", ids.len());
+            let max = job.max.min(ctx() - ids.len() - 32);
             let mut words: Vec<u32> = Vec::new();
             let mut sent = String::new();
             let t0 = Instant::now();
@@ -144,7 +158,8 @@ fn engine(entries: Vec<Entry>, rx: Receiver<Job>, ready: Sender<String>, status:
             let dt = t0.elapsed().as_secs_f64();
             eprintln!("{} | {} prompt words | {} words in {dt:.2}s = {:.1} words/s, {:.2} words/check", l.id,
                       ids.len(), words.len(), words.len() as f64 / dt, words.len() as f64 / passes.max(1) as f64);
-            Ok(json!({"model": l.id, "words": words.len(), "seconds": dt, "checks": passes, "prompt_words": ids.len()}))
+            let finish = if words.len() >= max { "length" } else { "stop" };
+            Ok(json!({"model": l.id, "words": words.len(), "seconds": dt, "checks": passes, "prompt_words": ids.len(), "finish": finish}))
         })();
         let _ = job.out.send(match r { Ok(v) => Ev::Done(v), Err(e) => Ev::Err(e.to_string()) });
     }
@@ -202,7 +217,7 @@ impl Sse {
             }
             Ev::Done(stats) => {
                 let mut b = format!("data: {}\n\n", json!({"id": self.id, "object": "chat.completion.chunk", "created": 0, "model": self.model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "fast_rs": stats})).into_bytes();
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": stats["finish"].as_str().unwrap_or("stop")}], "fast_rs": stats})).into_bytes();
                 b.extend(b"data: [DONE]\n\n");
                 self.finished = Some(b);
             }
@@ -298,7 +313,7 @@ pub fn run(model: String, guesser: Option<String>, port: u16) -> Result<()> {
                 let job = Job {
                     model: want.clone(),
                     messages: b["messages"].as_array().cloned().unwrap_or_default(),
-                    max: b["max_tokens"].as_u64().or(b["max_completion_tokens"].as_u64()).unwrap_or(1024) as usize,
+                    max: b["max_tokens"].as_u64().or(b["max_completion_tokens"].as_u64()).map(|x| x as usize).unwrap_or(usize::MAX), // no cap unless asked
                     out: otx,
                 };
                 let _ = jtx.lock().unwrap().send(job);

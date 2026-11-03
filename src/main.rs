@@ -561,6 +561,10 @@ struct Model {
 }
 
 impl Model {
+    pub(crate) fn gpu_bytes(&self) -> usize {
+        self.gpu.dev.currentAllocatedSize()
+    }
+
     fn load(dir: &Path, guesser: Option<&Path>, maxlen: usize) -> Result<Self> {
         let gpu = Gpu::new()?;
         let c: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
