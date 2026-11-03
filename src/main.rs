@@ -317,9 +317,11 @@ struct Model {
     t: Stack,
     g: Option<Guesser>,
     maxlen: usize,
+    emb: Weights, // the word table stays in the file; each pass copies only its rows (saves ~0.35 GB of GPU memory on 8B)
     emb_w: Buf,
     emb_s: Buf,
     emb_b: Buf,
+    emb_ids: Buf,
     head: QW,
     ids: Buf,
     pos: Buf,
@@ -386,9 +388,11 @@ impl Model {
         let xw = cfg.d.max(cfg.inter).max(cfg.h * cfg.hd).max(5 * cfg.d);
         let nf = g.as_ref().map(|g| g.target_layers.len()).unwrap_or(1);
         Ok(Model {
-            emb_w: gpu.buf_from(w.u32s("model.embed_tokens.weight")?),
-            emb_s: gpu.buf_from(w.u16s("model.embed_tokens.scales")?),
-            emb_b: gpu.buf_from(w.u16s("model.embed_tokens.biases")?),
+            emb_w: gpu.buf(r * cfg.d / 2),
+            emb_s: gpu.buf(r * cfg.d / 64 * 2),
+            emb_b: gpu.buf(r * cfg.d / 64 * 2),
+            emb_ids: gpu.buf_from(&(0..r as i32).collect::<Vec<_>>()),
+            emb: w,
             head,
             ids: gpu.buf(r * 4),
             pos: gpu.buf(r * 4),
@@ -625,7 +629,15 @@ impl Model {
     fn enc_embed(&mut self, e: &Enc, d: usize, n: usize) -> Result<()> {
         let p = self.gpu.pipe("embed", kernels::EMBED, &[("D", d.to_string())])?;
         e.setComputePipelineState(&p);
-        let b = [self.ids.clone(), self.emb_w.clone(), self.emb_s.clone(), self.emb_b.clone(), self.h.clone()];
+        let ids: Vec<i32> = read(&self.ids, n);
+        let (tw, ts, tb) = (self.emb.u32s("model.embed_tokens.weight")?, self.emb.u16s("model.embed_tokens.scales")?,
+                            self.emb.u16s("model.embed_tokens.biases")?);
+        let (rw, rs) = (d / 8, d / 64);
+        let gather = |t: &[u16]| -> Vec<u16> { ids.iter().flat_map(|&i| t[i as usize * rs..(i as usize + 1) * rs].iter().copied()).collect() };
+        write(&self.emb_w, &ids.iter().flat_map(|&i| tw[i as usize * rw..(i as usize + 1) * rw].iter().copied()).collect::<Vec<u32>>());
+        write(&self.emb_s, &gather(ts));
+        write(&self.emb_b, &gather(tb));
+        let b = [self.emb_ids.clone(), self.emb_w.clone(), self.emb_s.clone(), self.emb_b.clone(), self.h.clone()];
         bind(e, &[&b[0], &b[1], &b[2], &b[3], &b[4]]);
         e.dispatchThreads_threadsPerThreadgroup(MTLSize { width: d, height: n, depth: 1 }, sz(256));
         Ok(())
@@ -1043,6 +1055,8 @@ fn main() -> Result<()> {
     let guesser = a.get(4).map(Path::new);
     let budgets: Vec<usize> = a.get(5).map(|s| s.split(',').map(|x| x.parse().unwrap()).collect()).unwrap_or(vec![8, 16]);
     let mut m = Model::load(dir, guesser, 4096)?;
+    eprintln!("GPU memory {:.2} GB of {:.2} GB comfortable", m.gpu.dev.currentAllocatedSize() as f64 / 1e9,
+              m.gpu.dev.recommendedMaxWorkingSetSize() as f64 / 1e9);
     m.autotune()?;
     if std::env::var("BENCH_QMM").is_ok() {
         // GPU time of each target matrix at 8 and 16 rows (20 repeats in one encoder)
