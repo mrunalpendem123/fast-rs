@@ -137,7 +137,7 @@ body.app header { padding-top: 12px; -webkit-app-region: drag; }
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </button>
     </form>
-    <div class="hint">Enter to send · Shift+Enter for a new line · answers are word-for-word what plain decoding gives</div>
+    <div class="hint">Enter to send · Shift+Enter for a new line · Esc to stop · answers are word-for-word what plain decoding gives</div>
   </footer>
 </main>
 <script>
@@ -278,7 +278,9 @@ const input = $("input"), sendBtn = $("send");
 function grow() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 220) + "px"; sendBtn.disabled = !busy && !input.value.trim(); }
 input.addEventListener("input", grow);
 input.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (!busy) send(); } });
-$("form").addEventListener("submit", e => { e.preventDefault(); if (busy) busy.abort(); else send(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && busy) stop(); });
+$("form").addEventListener("submit", e => { e.preventDefault(); if (busy) stop(); else send(); });
+function stop() { if (!busy) return; const b = busy; b.stopped = true; b.abort(); if (b.reader) b.reader.cancel().catch(() => {}); }
 $("new").addEventListener("click", () => { if (!busy) newChat(); });
 document.addEventListener("keydown", e => { if (e.metaKey && e.key.toLowerCase() === "n") { e.preventDefault(); if (!busy) newChat(); } });
 
@@ -300,19 +302,22 @@ async function send() {
   try {
     const r = await fetch("/v1/chat/completions", {method: "POST", signal: busy.signal, headers: {"content-type": "application/json"},
       body: JSON.stringify({model, stream: true, max_tokens: 2048, messages: cur.messages.map(m => ({role: m.role, content: m.content}))})});
-    const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
-    for (;;) {
+    const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "", end = false;
+    busy.reader = rd;
+    while (!end) {
       const {value, done} = await rd.read(); if (done) break;
       buf += dec.decode(value, {stream: true});
       let k; while ((k = buf.indexOf("\n\n")) >= 0) {
         const line = buf.slice(0, k).trim(); buf = buf.slice(k + 2);
-        if (!line.startsWith("data:") || line.includes("[DONE]")) continue;
+        if (line.includes("[DONE]")) { end = true; break; }
+        if (!line.startsWith("data:")) continue;
         const j = JSON.parse(line.slice(5));
         const c = j.choices?.[0]?.delta?.content; if (c) { bot.content += c; if (!pending) { pending = true; requestAnimationFrame(paint); } }
         if (j.fast_rs) bot.stats = j.fast_rs;
       }
     }
-  } catch (e) { if (e.name !== "AbortError") bot.error = "The engine stopped answering. Check that fast-rs is running."; }
+    rd.cancel().catch(() => {});
+  } catch (e) { if (e.name !== "AbortError" && !(busy && busy.stopped)) bot.error = "The engine stopped answering. Check that fast-rs is running."; }
   busy = null; sendBtn.classList.remove("stop"); sendBtn.setAttribute("aria-label", "Send");
   sendBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   grow();

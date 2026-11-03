@@ -308,11 +308,16 @@ pub fn run(model: String, guesser: Option<String>, port: u16) -> Result<()> {
                         // write the stream straight to the socket and flush every word (a buffered response arrives in bursts)
                         let mut sse = Sse::new(orx, id2);
                         let mut w = req.into_writer();
-                        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+                        // chunked encoding marks the end of the answer explicitly (the socket itself may stay open)
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
                         if w.write_all(head.as_bytes()).and_then(|_| w.flush()).is_err() { return; }
                         while let Some(c) = sse.next_chunk() {
-                            if w.write_all(&c).and_then(|_| w.flush()).is_err() { break; } // client left: dropping sse stops the engine
+                            let mut piece = format!("{:x}\r\n", c.len()).into_bytes();
+                            piece.extend_from_slice(&c);
+                            piece.extend_from_slice(b"\r\n");
+                            if w.write_all(&piece).and_then(|_| w.flush()).is_err() { return; } // client left: dropping sse stops the engine
                         }
+                        let _ = w.write_all(b"0\r\n\r\n").and_then(|_| w.flush());
                     } else {
                         let mut text = String::new();
                         let mut err = None;
