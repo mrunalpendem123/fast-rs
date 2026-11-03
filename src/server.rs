@@ -19,6 +19,7 @@ enum Ev {
 
 struct Job {
     model: String,
+    think: bool,
     messages: Vec<Value>,
     max: usize,
     out: Sender<Ev>,
@@ -33,6 +34,11 @@ pub(crate) fn template(dir: &PathBuf) -> Result<String> {
 }
 
 pub(crate) fn render(env: &Environment, messages: &[Value]) -> Result<String> {
+    render_with(env, messages, false)
+}
+
+/// `think`: let models that support it reason first (Qwen3 / Qwen3.5 write it between <think> tags).
+pub(crate) fn render_with(env: &Environment, messages: &[Value], think: bool) -> Result<String> {
     let msgs: Vec<minijinja::Value> = messages.iter().map(|m| {
         let content = match &m["content"] {
             Value::String(s) => s.clone(),
@@ -41,7 +47,7 @@ pub(crate) fn render(env: &Environment, messages: &[Value]) -> Result<String> {
         };
         context! {role => m["role"].as_str().unwrap_or("user").to_string(), content => content}
     }).collect();
-    Ok(env.get_template("chat")?.render(context! {messages => msgs, add_generation_prompt => true, enable_thinking => false})?)
+    Ok(env.get_template("chat")?.render(context! {messages => msgs, add_generation_prompt => true, enable_thinking => think})?)
 }
 
 /// Models this Mac can serve: (id shown in the chat app, model dir, guesser dir). Only pairs that fit 8 GB and
@@ -114,7 +120,7 @@ fn budget() -> usize {
 fn engine(entries: Vec<Entry>, rx: Receiver<Job>, ready: Sender<String>, status: Arc<Mutex<Value>>) -> Result<()> {
     *status.lock().unwrap() = json!({"loaded": null, "loading": entries[0].id});
     let mut cur = Some(load(&entries[0])?);
-    *status.lock().unwrap() = json!({"loaded": entries[0].id, "loading": null});
+    *status.lock().unwrap() = json!({"loaded": entries[0].id, "loading": null, "gpu_gb": cur.as_ref().map(|l| l.m.gpu_bytes() as f64 / 1e9)});
     let _ = ready.send(entries[0].id.clone());
     while let Ok(job) = rx.recv() {
         let r = (|| -> Result<Value> {
@@ -124,7 +130,8 @@ fn engine(entries: Vec<Entry>, rx: Receiver<Job>, ready: Sender<String>, status:
                     cur = None;
                     *status.lock().unwrap() = json!({"loaded": null, "loading": e.id});
                     let l = load(e);
-                    *status.lock().unwrap() = json!({"loaded": l.as_ref().ok().map(|l| l.id.clone()), "loading": null});
+                    *status.lock().unwrap() = json!({"loaded": l.as_ref().ok().map(|l| l.id.clone()), "loading": null,
+                        "gpu_gb": l.as_ref().ok().map(|l| l.m.gpu_bytes() as f64 / 1e9)});
                     cur = Some(l?);
                 }
             }
@@ -132,7 +139,7 @@ fn engine(entries: Vec<Entry>, rx: Receiver<Job>, ready: Sender<String>, status:
             // long chats: drop the oldest turns (keeping any system message) until the prompt leaves room to answer
             let mut msgs = job.messages.clone();
             let ids: Vec<i32> = loop {
-                let text = render(&l.env, &msgs)?;
+                let text = render_with(&l.env, &msgs, job.think)?;
                 let ids: Vec<i32> = l.tok.encode(text, false).map_err(|e| anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
                 let first = msgs.iter().position(|m| m["role"] != "system").unwrap_or(0);
                 if ids.len() + 1024 <= ctx() || msgs.len() - first <= 1 { break ids; }
@@ -300,7 +307,7 @@ pub fn run(model: String, guesser: Option<String>, port: u16) -> Result<()> {
                 let h = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
                 let _ = req.respond(tiny_http::Response::from_string(include_str!("chat.html")).with_header(h));
             }
-            ("GET", "/status") => { let v = status.lock().unwrap().clone(); json_resp(req, v, 200) }
+            ("GET", "/status") => { let mut v = status.lock().unwrap().clone(); v["context"] = json!(ctx()); json_resp(req, v, 200) }
             ("GET", "/v1/models") | ("GET", "/models") => {
                 json_resp(req, json!({"object": "list", "data": ids.iter().map(|i| json!({"id": i, "object": "model", "owned_by": "local", "created": 0})).collect::<Vec<_>>()}), 200)
             }
@@ -312,6 +319,7 @@ pub fn run(model: String, guesser: Option<String>, port: u16) -> Result<()> {
                 let want = b["model"].as_str().unwrap_or(&id).to_string();
                 let job = Job {
                     model: want.clone(),
+                    think: b["think"].as_bool().or(b["chat_template_kwargs"]["enable_thinking"].as_bool()).unwrap_or(false),
                     messages: b["messages"].as_array().cloned().unwrap_or_default(),
                     max: b["max_tokens"].as_u64().or(b["max_completion_tokens"].as_u64()).map(|x| x as usize).unwrap_or(usize::MAX), // no cap unless asked
                     out: otx,
