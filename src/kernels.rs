@@ -358,12 +358,14 @@ kernel void topk3(const device float* lg [[buffer(0)]], device float* tv [[buffe
 /// Gated DeltaNet (Qwen3.5 linear layers), step 1 per (row, 128-channel block): causal depthwise conv (kernel 4) over
 /// the row's own history (earlier rows of this pass via prev[row][3] >= 0, else the committed tail: -1 newest .. -3
 /// oldest), silu, then q/k heads L2-normalised (q also scaled by 1/DK). keep: also save the row's raw and final
-/// values and its b/a inputs, so an accepted guess can be committed later. Defines: C, KD, DK, VD, HV, NLIN, KS.
+/// values and its g/beta, so an accepted guess can be committed later. Also each value head's decay g and write
+/// strength beta -> gb [n][2*HV]. Defines: C, KD, DK, VD, HV, NLIN, KS.
 pub const LIN_CONV: &str = r#"
 struct LArgs { int keep; int n; };
 kernel void lin_conv(const device float* pre [[buffer(0)]], const device float* tail [[buffer(1)]],
                      const device bfloat* w [[buffer(2)]], const device int* prev [[buffer(3)]],
                      device float* post [[buffer(4)]], device float* keep [[buffer(5)]], constant LArgs& a [[buffer(6)]],
+                     const device float* alog [[buffer(7)]], const device bfloat* dtb [[buffer(8)]], device float* gb [[buffer(9)]],
                      uint lane [[thread_index_in_simdgroup]], uint gid [[threadgroup_position_in_grid]]) {
     const int NB = C / 128;
     int row = int(gid) / NB, blk = int(gid) % NB;
@@ -392,8 +394,17 @@ kernel void lin_conv(const device float* pre [[buffer(0)]], const device float* 
         post[row * C + c] = v[e];
         if (a.keep && row < a.n) { keep[row * KS + c] = x0[e]; keep[row * KS + C + c] = v[e]; }
     }
-    if (a.keep && row < a.n && blk == 0)
-        for (int i = int(lane); i < 2 * HV; i += 32) keep[row * KS + 2 * C + i] = pre[row * NLIN + C + VD + i];
+    if (blk == 0) {
+        // decay g and write strength beta per value head (once per row, not per state row)
+        for (int hv = int(lane); hv < HV; hv += 32) {
+            float bb = pre[row * NLIN + C + VD + hv], aa = pre[row * NLIN + C + VD + HV + hv] + float(dtb[hv]);
+            float soft = aa > 20.0f ? aa : log(1.0f + exp(aa));
+            float g = exp(-exp(alog[hv]) * soft), beta = 1.0f / (1.0f + exp(-bb));
+            gb[row * 2 * HV + hv] = g;
+            gb[row * 2 * HV + HV + hv] = beta;
+            if (a.keep && row < a.n) { keep[row * KS + 2 * C + hv] = g; keep[row * KS + 2 * C + HV + hv] = beta; }
+        }
+    }
 }
 "#;
 
@@ -410,46 +421,49 @@ kernel void lin_tail(const device float* src [[buffer(0)]], const device int* ri
 "#;
 
 /// Delta rule, one simdgroup per (value head, value row of the state); each lane owns 4 key columns. Rows are taken in
-/// order j = 0..n (row ridx[j]); row j starts from the state after row par[j] (-1: the committed state), so a tree's
-/// branches each get their own state (parents come first) and a chain is the same arithmetic. write: store the last
-/// row's state as the new committed state. One kernel for prompt chunks, single words, trees and commits: a word's
-/// numbers never depend on which. Defines: HV, HK, DK, DV, KD.
+/// order j = 0..n (row ridx[j]). tree: row j starts from the state after row par[j] (-1: the committed state), so each
+/// branch gets its own state (parents come first) and the committed state is left as it is. Otherwise a chain from the
+/// committed state; write: store the last state as the new committed one. Every row goes through delta_step, so prompt
+/// chunks, single words, trees and commits share one arithmetic. Defines: HV, HK, DK, DV, KD.
 pub const LIN_DELTA: &str = r#"
-struct DArgs { int n; int write; int pstride; int poff; int abstride; int boff; };
-kernel void lin_delta(const device float* post [[buffer(0)]], const device float* ab [[buffer(1)]],
-                      const device float* alog [[buffer(2)]], const device bfloat* dtb [[buffer(3)]],
+struct DArgs { int n; int write; int pstride; int poff; int abstride; int boff; int tree; };
+// one row of the delta rule for this lane's R state rows (s in place); explicit fma so every call site rounds the same
+inline void delta_step(thread float (&s)[R][4], const device float* post, const device float* gb, int r, constant DArgs& a,
+                       int hv, int hk, int dv0, uint lane, device float* y) {
+    const device float* pr = post + r * a.pstride + a.poff;
+    float4 q = *(const device float4*)(pr + hk * DK + int(lane) * 4);
+    float4 k = *(const device float4*)(pr + KD + hk * DK + int(lane) * 4);
+    float g = gb[r * a.abstride + a.boff + hv], beta = gb[r * a.abstride + a.boff + HV + hv];
+    float kv[R], out[R];
+    for (int d = 0; d < R; d++) {
+        kv[d] = 0.0f;
+        for (int i = 0; i < 4; i++) { s[d][i] = s[d][i] * g; kv[d] = fma(s[d][i], k[i], kv[d]); }
+    }
+    for (int d = 0; d < R; d++) kv[d] = simd_sum(kv[d]);
+    for (int d = 0; d < R; d++) {
+        float delta = (pr[2 * KD + hv * DV + dv0 + d] - kv[d]) * beta;
+        out[d] = 0.0f;
+        for (int i = 0; i < 4; i++) { s[d][i] = fma(k[i], delta, s[d][i]); out[d] = fma(s[d][i], q[i], out[d]); }
+    }
+    for (int d = 0; d < R; d++) out[d] = simd_sum(out[d]);
+    for (int d = 0; d < R; d++) if (int(lane) == d) y[r * (HV * DV) + hv * DV + dv0 + d] = out[d];
+}
+kernel void lin_delta(const device float* post [[buffer(0)]], const device float* gb [[buffer(1)]],
                       device float* state [[buffer(4)]], const device int* par [[buffer(5)]], const device int* ridx [[buffer(6)]],
                       device float* y [[buffer(7)]], constant DArgs& a [[buffer(8)]],
                       uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                       uint2 tg [[threadgroup_position_in_grid]]) {
-    int hv = int(tg.x), dv = int(tg.y) * 4 + int(sg), hk = hv / (HV / HK);
-    device float* sp = state + (hv * DV + dv) * DK + int(lane) * 4;
-    float s0[4], cur[4], st[16][4];
-    for (int i = 0; i < 4; i++) { s0[i] = sp[i]; cur[i] = s0[i]; }
-    float A = exp(alog[hv]), bias = float(dtb[hv]);
+    int hv = int(tg.x), dv0 = (int(tg.y) * 4 + int(sg)) * R, hk = hv / (HV / HK);
+    device float* sp = state + (hv * DV + dv0) * DK + int(lane) * 4;
+    float s0[R][4], cur[R][4], st[16][R][4];
+    for (int d = 0; d < R; d++) for (int i = 0; i < 4; i++) { s0[d][i] = sp[d * DK + i]; cur[d][i] = s0[d][i]; }
     for (int j = 0; j < a.n; j++) {
-        int r = ridx[j], pj = par[j];
-        float s[4];
-        for (int i = 0; i < 4; i++) s[i] = pj < 0 ? s0[i] : (pj == j - 1 ? cur[i] : st[pj][i]);
-        const device float* pr = post + r * a.pstride + a.poff;
-        const device float* q = pr + hk * DK + int(lane) * 4;
-        const device float* k = pr + KD + hk * DK + int(lane) * 4;
-        float v = pr[2 * KD + hv * DV + dv];
-        float bb = ab[r * a.abstride + a.boff + hv], aa = ab[r * a.abstride + a.boff + HV + hv] + bias;
-        float soft = aa > 20.0f ? aa : log(1.0f + exp(aa));
-        float g = exp(-A * soft), beta = 1.0f / (1.0f + exp(-bb));
-        float kv = 0.0f;
-        for (int i = 0; i < 4; i++) { s[i] = s[i] * g; kv += s[i] * k[i]; }
-        kv = simd_sum(kv);
-        float delta = (v - kv) * beta;
-        float o = 0.0f;
-        for (int i = 0; i < 4; i++) { s[i] = s[i] + k[i] * delta; o += s[i] * q[i]; }
-        o = simd_sum(o);
-        if (lane == 0) y[r * (HV * DV) + hv * DV + dv] = o;
-        for (int i = 0; i < 4; i++) cur[i] = s[i];
-        if (j < 16) for (int i = 0; i < 4; i++) st[j][i] = s[i];
+        int pj = a.tree ? par[j] : j - 1;
+        if (pj != j - 1) for (int d = 0; d < R; d++) for (int i = 0; i < 4; i++) cur[d][i] = pj < 0 ? s0[d][i] : st[pj][d][i];
+        delta_step(cur, post, gb, ridx[j], a, hv, hk, dv0, lane, y);
+        if (a.tree && j < 16) for (int d = 0; d < R; d++) for (int i = 0; i < 4; i++) st[j][d][i] = cur[d][i];
     }
-    if (a.write && a.n > 0) for (int i = 0; i < 4; i++) sp[i] = cur[i];
+    if (a.write && a.n > 0) for (int d = 0; d < R; d++) for (int i = 0; i < 4; i++) sp[d * DK + i] = cur[d][i];
 }
 "#;
 

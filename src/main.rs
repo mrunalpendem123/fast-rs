@@ -23,6 +23,7 @@ type Enc = ProtocolObject<dyn MTLComputeCommandEncoder>;
 const MAXD: usize = 16; // deepest tree path / guesser block
 const BS: usize = 128; // attention key block
 const MAXR: usize = 128; // rows per pass (prompt chunk)
+const LIN_R: usize = 4; // state rows per lane in the delta-rule kernel for chains (trees: 1, so branch states fit registers)
 
 struct Gpu {
     dev: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -305,6 +306,13 @@ fn lin_defs(c: &Cfg) -> Vec<(&'static str, String)> {
         .into_iter().map(|(k, v)| (k, v.to_string())).chain([("EPS", format!("{:e}f", c.eps))]).collect()
 }
 
+/// Delta-rule pipeline defines: R state rows per lane (same arithmetic per state element for any R).
+fn delta_defs(c: &Cfg, r: usize) -> Vec<(&'static str, String)> {
+    let mut d = lin_defs(c);
+    d.push(("R", r.to_string()));
+    d
+}
+
 fn set_args(e: &Enc, a: &[i32], idx: usize) {
     unsafe { e.setBytes_length_atIndex(NonNull::new(a.as_ptr() as *mut c_void).unwrap(), a.len() * 4, idx) };
 }
@@ -423,6 +431,7 @@ struct Model {
     lin_par: Buf,   // [rows]: row whose state each row continues (-1: committed)
     lin_acc: Buf,   // accepted tree rows, for commit
     lin_chain: Buf, // -1, 0, 1, ...: a chain's parents
+    lin_gb: Buf,    // [rows][2*HV]: per row and value head, decay g and write strength beta
     lin_tree: bool, // the next pass is a guess tree: linear layers keep their committed state until commit()
     head: QW,
     ids: Buf,
@@ -445,6 +454,7 @@ struct Model {
     p: usize,
     hist: Vec<i32>,
     pub draft_s: f64,
+    commit_s: f64,
     tune: HashMap<String, (usize, usize)>,
     want_depth: usize,   // deepest tree level the next guess needs (budget - 1)
     pub reuse: bool,     // keep the memory of words a new prompt shares with the previous conversation
@@ -508,6 +518,7 @@ impl Model {
             lin_par: gpu.buf(r * 4),
             lin_acc: gpu.buf(MAXD * 4),
             lin_chain: gpu.buf_from(&(-1..r as i32 - 1).collect::<Vec<_>>()),
+            lin_gb: gpu.buf(r * 2 * lc.hv.max(1) * 4),
             lin_tree: false,
             head,
             ids: gpu.buf(r * 4),
@@ -534,6 +545,7 @@ impl Model {
             p: 0,
             hist: Vec::new(),
             draft_s: 0.0,
+            commit_s: 0.0,
             tune: HashMap::new(),
             want_depth: 15,
             reuse: false,
@@ -832,7 +844,7 @@ impl Model {
         self.enc_qmm(e, &l.qkv, [xh, xo, xs], gu, n, false)?;
         let p = self.gpu.pipe("lin_conv", kernels::LIN_CONV, &defs)?;
         e.setComputePipelineState(&p);
-        bind(e, &[gu, &lin.tail, &lin.conv, prev, post, &lin.keep]);
+        bind(e, &[gu, &lin.tail, &lin.conv, prev, post, &lin.keep, &self.lin_gb /* 6: args */, &lin.alog, &lin.dtb, &self.lin_gb]);
         set_args(e, &[tree as i32, n_real as i32], 6);
         e.dispatchThreadgroups_threadsPerThreadgroup(sz(n * cc / 128), sz(32));
         if !tree {
@@ -842,11 +854,12 @@ impl Model {
             set_args(e, &[n_real as i32, nlin as i32], 3);
             e.dispatchThreads_threadsPerThreadgroup(sz(cc), sz(256));
         }
-        let p = self.gpu.pipe("lin_delta", kernels::LIN_DELTA, &defs)?;
+        let r = if tree { 1 } else { LIN_R };
+        let p = self.gpu.pipe("lin_delta", kernels::LIN_DELTA, &delta_defs(c, r))?;
         e.setComputePipelineState(&p);
-        bind(e, &[post, gu, &lin.alog, &lin.dtb, &lin.state, par, ident, y]);
-        set_args(e, &[n_real as i32, !tree as i32, cc as i32, 0, nlin as i32, (cc + lc.hv * lc.dv) as i32], 8);
-        e.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: lc.hv, height: lc.dv / 4, depth: 1 }, sz(128));
+        bind(e, &[post, &self.lin_gb, post, post, &lin.state, par, ident, y]);
+        set_args(e, &[n_real as i32, !tree as i32, cc as i32, 0, 2 * lc.hv as i32, 0, tree as i32], 8);
+        e.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: lc.hv, height: lc.dv / 4 / r, depth: 1 }, sz(128));
         let p = self.gpu.pipe("lin_norm", kernels::LIN_NORM, &defs)?;
         e.setComputePipelineState(&p);
         bind(e, &[y, gu, &lin.norm, xh, xo, xs]);
@@ -1150,16 +1163,16 @@ impl Model {
             let (cc, ks) = (lc.c() as i32, lc.ks() as i32);
             write(&self.lin_acc, &acc.iter().map(|&a| a as i32).collect::<Vec<_>>());
             let defs = lin_defs(&c);
-            let pd = self.gpu.pipe("lin_delta", kernels::LIN_DELTA, &defs)?;
+            let pd = self.gpu.pipe("lin_delta", kernels::LIN_DELTA, &delta_defs(&c, LIN_R))?;
             let pt = self.gpu.pipe("lin_tail", kernels::LIN_TAIL, &defs)?;
             let cb = self.gpu.queue.commandBuffer().context("cb")?;
             let e = cb.computeCommandEncoder().context("enc")?;
             for l in &self.t.layers {
                 let Some(lin) = &l.lin else { continue };
                 e.setComputePipelineState(&pd);
-                bind(&e, &[&lin.keep, &lin.keep, &lin.alog, &lin.dtb, &lin.state, &self.lin_chain, &self.lin_acc, &self.q]);
-                set_args(&e, &[acc.len() as i32, 1, ks, cc, ks, 2 * cc], 8);
-                e.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: lc.hv, height: lc.dv / 4, depth: 1 }, sz(128));
+                bind(&e, &[&lin.keep, &lin.keep, &lin.keep, &lin.keep, &lin.state, &self.lin_chain, &self.lin_acc, &self.q]);
+                set_args(&e, &[acc.len() as i32, 1, ks, cc, ks, 2 * cc, 0], 8);
+                e.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: lc.hv, height: lc.dv / 4 / LIN_R, depth: 1 }, sz(128));
                 e.setComputePipelineState(&pt);
                 bind(&e, &[&lin.keep, &self.lin_acc, &lin.tail]);
                 set_args(&e, &[acc.len() as i32, ks], 3);
@@ -1188,6 +1201,7 @@ impl Model {
         }
         self.rewind(keep);
         self.draft_s = 0.0;
+        self.commit_s = 0.0;
         let mut y = self.feed(&prompt[keep..])?;
         let mut n_out = 1;
         let mut passes = 0;
@@ -1243,7 +1257,9 @@ impl Model {
                 self.hist.push(toks[a]);
             }
             self.keep_features(&acc);
+            let tc = Instant::now();
             self.commit(&acc)?;
+            self.commit_s += tc.elapsed().as_secs_f64();
             emitted.truncate(max_new - n_out);
             n_out += emitted.len();
             y = *emitted.last().unwrap();
@@ -1285,6 +1301,36 @@ fn main() -> Result<()> {
     eprintln!("GPU memory {:.2} GB of {:.2} GB comfortable", m.gpu.dev.currentAllocatedSize() as f64 / 1e9,
               m.gpu.dev.recommendedMaxWorkingSetSize() as f64 / 1e9);
     m.autotune()?;
+    if std::env::var("BENCH_LIN").is_ok() {
+        // GPU time of one linear layer's kernels at 1 / 8 / 16 rows, tree and chain (20 repeats in one encoder)
+        let li = m.t.layers.iter().position(|l| l.lin.is_some()).context("no linear layer")?;
+        let l = unsafe { &*(&m.t.layers[li] as *const Layer) };
+        let c = m.t.cfg.clone();
+        for rows in [1usize, 8, 16] {
+            for tree in [false, true] {
+                m.lin_tree = tree;
+                let n = rows.div_ceil(8) * 8;
+                let rr: Vec<[i32; 4]> = (0..rows).map(|j| [j as i32, 0, j as i32 + 1, 0]).collect();
+                let aa: Vec<[i32; MAXD]> = (0..rows).map(|j| { let mut a = [0i32; MAXD]; for k in 0..=j { a[k] = k as i32; } a }).collect();
+                m.write_lin(&rr, &aa, rows, n);
+                let mut best = f64::MAX;
+                for _ in 0..10 {
+                    let cb = m.gpu.queue.commandBuffer().unwrap();
+                    let e = cb.computeCommandEncoder().unwrap();
+                    for _ in 0..20 {
+                        m.enc_lin(&e, &c, l, l.lin.as_ref().unwrap(), n, rows)?;
+                    }
+                    e.endEncoding();
+                    cb.commit();
+                    cb.waitUntilCompleted();
+                    best = best.min((cb.GPUEndTime() - cb.GPUStartTime()) / 20.0);
+                }
+                println!("linear layer, {rows:2} rows, {}: {:6.1} us", if tree { "tree " } else { "chain" }, best * 1e6);
+            }
+        }
+        m.lin_tree = false;
+        return Ok(());
+    }
     if std::env::var("BENCH_QMM").is_ok() {
         // GPU time of each target matrix at 8 and 16 rows (20 repeats in one encoder)
         let l0 = unsafe { &*(&m.t.layers[0] as *const Layer) };
@@ -1327,8 +1373,9 @@ fn main() -> Result<()> {
             for &b in &budgets {
                 m.tree(&ids, 16, &eos, b)?; // warm up this tree size
                 let (tree, tt, passes) = m.tree(&ids, max_new, &eos, b)?;
-                line += &format!(" | tree{b}: {:5.1} w/s {:.2} w/chk (guess {:.1} + check {:.1} ms) {}", tree.len() as f64 / tt,
+                line += &format!(" | tree{b}: {:5.1} w/s {:.2} w/chk (guess {:.1} + check {:.1} ms, commit {:.1}) {}", tree.len() as f64 / tt,
                     tree.len() as f64 / passes as f64, m.draft_s / passes as f64 * 1e3, (tt - m.draft_s) / passes as f64 * 1e3,
+                    m.commit_s / passes as f64 * 1e3,
                     if tree == plain { "OK" } else { "DIFF" });
             }
         }
