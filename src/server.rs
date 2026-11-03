@@ -68,6 +68,7 @@ fn engine(model: PathBuf, guesser: Option<PathBuf>, rx: Receiver<Job>, ready: Se
     let warm: Vec<i32> = tok.encode(render(&env, &[json!({"role": "user", "content": "Hi"})])?, false).map_err(|e| anyhow!("{e}"))?
         .get_ids().iter().map(|&x| x as i32).collect();
     m.generate(&warm, 8, &eos, budget, &mut |_| true)?;
+    m.reuse = true; // follow-up messages keep the memory of the conversation so far (exact: same words as rereading it)
     let _ = ready.send(model.file_name().unwrap().to_string_lossy().to_string());
     while let Ok(job) = rx.recv() {
         let r = (|| -> Result<()> {

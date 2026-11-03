@@ -343,6 +343,7 @@ struct Model {
     pub draft_s: f64,
     tune: HashMap<String, (usize, usize)>,
     want_depth: usize,   // deepest tree level the next guess needs (budget - 1)
+    pub reuse: bool,     // keep the memory of words a new prompt shares with the previous conversation
 }
 
 impl Model {
@@ -415,6 +416,7 @@ impl Model {
             draft_s: 0.0,
             tune: HashMap::new(),
             want_depth: 15,
+            reuse: false,
         })
     }
 
@@ -516,6 +518,31 @@ impl Model {
         Ok(())
     }
 
+    /// Words at the start of `prompt` whose memory is already in place from the previous call (at least one word is
+    /// left to read, for its next-word pick).
+    fn shared_prefix(&self, prompt: &[i32]) -> usize {
+        let n = self.hist.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+        n.min(prompt.len().saturating_sub(1))
+    }
+
+    /// Keep the first `keep` words of memory (target and guesser), forget the rest.
+    fn rewind(&mut self, keep: usize) {
+        if keep == 0 {
+            return self.reset();
+        }
+        self.p = keep;
+        self.hist.truncate(keep);
+        let f = self.g.as_ref().map(|g| g.target_layers.len() * self.t.cfg.d).unwrap_or(0);
+        if let Some(g) = &mut self.g {
+            if g.c > keep {
+                g.c = keep;
+                g.pending.clear();
+            } else {
+                g.pending.truncate((keep - g.c) * f);
+            }
+        }
+    }
+
     fn reset(&mut self) {
         self.p = 0;
         self.hist.clear();
@@ -526,7 +553,10 @@ impl Model {
     }
 
     fn cfg_for(&self, n: usize, k: usize, mt: usize) -> (usize, usize) {
-        if let Some(&c) = self.tune.get(&format!("{n}x{k}x{}", mt.min(2))) {
+        // one layout per matrix for every row count, so a word's numbers never depend on how many rows shared its
+        // pass (prompt chunk, guess tree or single word): what makes reusing an earlier turn's memory exact
+        let _ = mt;
+        if let Some(&c) = self.tune.get(&format!("{n}x{k}x1")) {
             return c;
         }
         let nt = if n % 32 == 0 { 2 } else { 1 };
@@ -919,9 +949,10 @@ impl Model {
     /// Exact tree decoding; `on_words` gets each pass's new words (return false to stop). Returns (seconds, passes).
     pub fn generate(&mut self, prompt: &[i32], max_new: usize, eos: &[i32], budget: usize,
                     on_words: &mut dyn FnMut(&[i32]) -> bool) -> Result<(f64, usize)> {
-        self.reset();
+        let keep = if self.reuse { self.shared_prefix(prompt) } else { 0 };
+        self.rewind(keep);
         self.draft_s = 0.0;
-        let mut y = self.feed(prompt)?;
+        let mut y = self.feed(&prompt[keep..])?;
         let mut n_out = 1;
         let mut passes = 0;
         let t = Instant::now();
@@ -990,6 +1021,10 @@ fn main() -> Result<()> {
     if a.get(1).map(|s| s.as_str()) == Some("specbench") {
         // fast-rs specbench MODEL GUESSER question.jsonl OUT.jsonl [MAX_NEW=1024] [BUDGET=8]
         return specbench(&a[2..]);
+    }
+    if a.get(1).map(|s| s.as_str()) == Some("prefixtest") {
+        // fast-rs prefixtest MODEL GUESSER question.jsonl [N] [MAX_NEW]
+        return prefixtest(&a[2..]);
     }
     if a.get(1).map(|s| s.as_str()) == Some("bench") {
         // fast-rs bench MODEL GUESSER|- PROMPTS.jsonl OUT.jsonl [RUNS] [BUDGET] [MAX_NEW]
@@ -1247,5 +1282,81 @@ fn specbench(a: &[String]) -> Result<()> {
     println!("{:16} {:>9} {:>12.1} {:>11.1} {:>7.2}x {:>13.2} {:>6}/{}", "overall", all.len(), mean(&b), mean(&me), mean(&me) / mean(&b), mean(&tau),
              all.iter().filter(|x| x.3).count(), all.len());
     println!("skipped (too long for {maxlen} context): {skipped} | total {:.0} min | end: swap {} | {}", t_all.elapsed().as_secs_f64() / 60.0, swap(), power());
+    Ok(())
+}
+
+/// Second turns of two-turn questions: plain decoding from scratch (the reference) vs guess-tree decoding that keeps
+/// the first turn's memory. Checks the outputs are identical and reports how much reading was skipped.
+fn prefixtest(a: &[String]) -> Result<()> {
+    let model = std::path::PathBuf::from(&a[0]);
+    let guesser = Some(&a[1]).filter(|s| s.as_str() != "-").map(std::path::PathBuf::from);
+    let qs = std::fs::read_to_string(&a[2])?;
+    let n_q: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
+    let max_new: usize = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(512);
+    let tok = tokenizers::Tokenizer::from_file(model.join("tokenizer.json")).map_err(|e| anyhow!("tokenizer: {e}"))?;
+    let mut env = minijinja::Environment::new();
+    minijinja_contrib::add_to_environment(&mut env);
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    env.add_template_owned("chat", server::template(&model)?)?;
+    let eos: Vec<i32> = ["<|im_end|>", "<|endoftext|>"].iter().filter_map(|t| tok.token_to_id(t)).map(|x| x as i32).collect();
+    let mut m = Model::load(&model, guesser.as_deref(), 6144)?;
+    m.autotune()?;
+    m.warm()?;
+    let enc = |msgs: &[serde_json::Value]| -> Result<Vec<i32>> {
+        Ok(tok.encode(server::render(&env, msgs)?, false).map_err(|e| anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect())
+    };
+    // a conversation: the question's turns plus two follow-ups. Pass 1 talks with memory reuse on; pass 2 replays
+    // every prompt of pass 1 from scratch (guess tree, then plain decoding as the reference).
+    let extra = ["Thanks. Now summarize everything above in two sentences.", "Give one practical example of that."];
+    let (mut same, mut turns_n, mut t_fresh, mut t_reuse, mut read_all, mut read_kept, mut done) = (0, 0, 0f64, 0f64, 0usize, 0usize, 0);
+    for line in qs.lines().filter(|l| !l.trim().is_empty()) {
+        let q: serde_json::Value = serde_json::from_str(line)?;
+        let mut turns: Vec<String> = q["turns"].as_array().unwrap().iter().map(|x| x.as_str().unwrap_or("").to_string()).collect();
+        turns.extend(extra.iter().map(|s| s.to_string()));
+        let mut msgs: Vec<serde_json::Value> = Vec::new();
+        let mut rec = Vec::new();
+        m.reset();
+        m.reuse = true;
+        for (k, turn) in turns.iter().enumerate() {
+            msgs.push(serde_json::json!({"role": "user", "content": turn}));
+            let ids = enc(&msgs)?;
+            if ids.len() + max_new + 64 > 6144 {
+                break;
+            }
+            let kept = m.shared_prefix(&ids);
+            let t = Instant::now();
+            let mut out = Vec::new();
+            m.generate(&ids, max_new, &eos, 8, &mut |w| { out.extend_from_slice(w); true })?;
+            let tr = t.elapsed().as_secs_f64();
+            let ans: Vec<u32> = out.iter().filter(|x| !eos.contains(x)).map(|&x| x as u32).collect();
+            msgs.push(serde_json::json!({"role": "assistant", "content": tok.decode(&ans, true).unwrap_or_default()}));
+            rec.push((k, ids, kept, out, tr));
+        }
+        m.reuse = false;
+        for (k, ids, kept, out, tr) in rec {
+            if k == 0 {
+                continue;
+            }
+            let t = Instant::now();
+            let mut out_f = Vec::new();
+            m.generate(&ids, max_new, &eos, 8, &mut |w| { out_f.extend_from_slice(w); true })?;
+            let tf = t.elapsed().as_secs_f64();
+            let (plain, _) = m.plain(&ids, max_new, &eos)?;
+            let ok = out == plain && out_f == plain;
+            same += ok as usize;
+            turns_n += 1;
+            t_fresh += tf;
+            t_reuse += tr;
+            read_all += ids.len();
+            read_kept += kept;
+            println!("q{} turn {}: prompt {:5} words, {:5} kept | fresh {:5.2}s, reuse {:5.2}s | identical {}", q["question_id"], k + 1, ids.len(), kept, tf, tr, ok);
+        }
+        done += 1;
+        if done == n_q {
+            break;
+        }
+    }
+    println!("{turns_n} follow-up turns: {same}/{turns_n} identical to plain | words kept {read_kept}/{read_all} | time fresh {t_fresh:.1}s, reuse {t_reuse:.1}s ({:.0}% less)",
+             100.0 * (1.0 - t_reuse / t_fresh));
     Ok(())
 }
