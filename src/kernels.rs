@@ -4,7 +4,8 @@
 
 pub const HEADER: &str = "#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\n";
 
-/// Embedding lookup from MLX 4-bit affine (group 64) rows, rounded to bf16 like MLX's dequantize. Defines: D.
+/// Embedding lookup from MLX 4-bit affine (group 64) rows, rounded to bf16 like MLX's dequantize, times ESCALE
+/// (Gemma scales its embeddings). Defines: D, ESCALE.
 pub const EMBED: &str = r#"
 kernel void embed(const device int* ids [[buffer(0)]], const device uint* w [[buffer(1)]],
                   const device bfloat* s [[buffer(2)]], const device bfloat* b [[buffer(3)]],
@@ -15,13 +16,18 @@ kernel void embed(const device int* ids [[buffer(0)]], const device uint* w [[bu
     uint word = w[t * (D / 8) + c / 8];
     float q = float((word >> (4 * (c % 8))) & 0xFu);
     float v = float(s[t * (D / 64) + c / 64]) * q + float(b[t * (D / 64) + c / 64]);
-    h[r * D + c] = float(bfloat(v));
+    h[r * D + c] = float(bfloat(v)) * ESCALE;
 }
 "#;
 
 /// Shared tail: from a row already written as half into xh (length KD), per 64-group sums for the v7 matmul.
 /// xs = sum(x), xo = sum(x * off(k)) with off = 1024 for even k-steps, 64 for odd ones.
+/// Also gelu_t, and row_scale: the power of two that brings a row's largest magnitude under half's range (1 for ordinary rows).
+/// Gemma 4's first word carries activations past 65504; dividing by 2^k and multiplying the matmul output back is exact.
 pub const GROUP_SUMS: &str = r#"
+inline float row_scale(float mx) { return mx > 16384.0f ? exp2(ceil(log2(mx / 16384.0f))) : 1.0f; }
+// GELU, tanh form. Metal's fast tanh overflows to NaN for large inputs; past |15| tanh is exactly +-1 in float anyway.
+inline float gelu_t(float x) { return 0.5f * x * (1.0f + tanh(clamp(0.7978845608028654f * (x + 0.044715f * x * x * x), -15.0f, 15.0f))); }
 inline void group_sums(const device half* xr, device float* xo, device float* xs, uint tid, uint nthreads, int kd) {
     for (int g = int(tid); g < kd / 64; g += int(nthreads)) {
         float a = 0.0f, o = 0.0f;
@@ -60,27 +66,51 @@ kernel void norm_prep(const device float* h [[buffer(0)]], const device bfloat* 
 }
 "#;
 
-/// silu(gate) * up -> half x + group sums. gu row = [gate (I) | up (I)]. Defines: I.
+/// act(gate) * up -> half x + group sums. gu row = [gate (I) | up (I)]; act: silu, or GELU (tanh form) when GELU.
+/// Defines: I, GELU.
 pub const SWIGLU_PREP: &str = r#"
 kernel void swiglu_prep(const device float* gu [[buffer(0)]], device half* xh [[buffer(1)]],
-                        device float* xo [[buffer(2)]], device float* xs [[buffer(3)]],
-                        uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+                        device float* xo [[buffer(2)]], device float* xs [[buffer(3)]], device float* rs [[buffer(4)]],
+                        uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     const device float* g = gu + row * (2 * I);
     device half* xr = xh + row * I;
-    for (int i = int(tid); i < I; i += 256) {
-        float a = g[i];
-        xr[i] = half(a / (1.0f + exp(-a)) * g[I + i]);
+    if (GELU) {
+        // Gemma 4: values can pass half's range; scale the row by a power of two (rs[row], undone after the matmul)
+        threadgroup float part[8];
+        float mx = 0.0f;
+        for (int i = int(tid); i < I; i += 256) {
+            float a = g[i];
+            mx = max(mx, abs(gelu_t(a) * g[I + i]));
+        }
+        mx = simd_max(mx);
+        if (lane == 0) part[sg] = mx;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float m = 0.0f;
+        for (int i = 0; i < 8; i++) m = max(m, part[i]);
+        float sc = row_scale(m);
+        if (tid == 0) rs[row] = sc;
+        for (int i = int(tid); i < I; i += 256) {
+            float a = g[i];
+            xr[i] = half(gelu_t(a) * g[I + i] / sc);
+        }
+    } else {
+        for (int i = int(tid); i < I; i += 256) {
+            float a = g[i];
+            xr[i] = half(a / (1.0f + exp(-a)) * g[I + i]);
+        }
     }
     threadgroup_barrier(mem_flags::mem_device);
     group_sums(xr, xo + row * (I / 64), xs + row * (I / 64), tid, 256, I);
 }
 "#;
 
-/// v7 check matmul (see fast/qmma7.py): out[M, N] (+)= x[M, K] . W^T. Defines: M, MT, K, N, NT, SK, ADD.
+/// v7 check matmul (see fast/qmma7.py): out[M, N] (+)= x[M, K] . W^T (times rs[m] when RS: the row's input scale).
+/// Defines: M, MT, K, N, NT, SK, ADD, RS.
 pub const QMM: &str = r#"
 kernel void qmm(const device half* x [[buffer(0)]], const device float* xoff [[buffer(1)]], const device float* xs [[buffer(2)]],
                 const device uint2* wq [[buffer(3)]], const device bfloat* sp [[buffer(4)]], const device bfloat* bp [[buffer(5)]],
-                device float* out [[buffer(6)]],
+                device float* out [[buffer(6)]], const device float* rs [[buffer(7)]],
                 uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                 uint tg [[threadgroup_position_in_grid]]) {
     const int NGRP = K / 64;
@@ -132,6 +162,7 @@ kernel void qmm(const device half* x [[buffer(0)]], const device float* xoff [[b
             float v = 0.0f;
             for (int q = 0; q < SK; q++) v += part[q][r][nn];
             int m = mt * 8 + r;
+            if (RS) v *= rs[m];
             if (m < M) {
                 if (ADD) out[m * N + t0 * 8 + nn] += v;
                 else out[m * N + t0 * 8 + nn] = v;
@@ -144,8 +175,10 @@ kernel void qmm(const device half* x [[buffer(0)]], const device float* xoff [[b
 
 /// Per (row, head): RMSNorm of q / k heads, RoPE (non-traditional) at the row's position, q scaled; k and v written to
 /// the memory at slot P + row. qkv row = [q (H*HD) | k (KVH*HD) | v (KVH*HD)]. One simdgroup per (row, head) over
-/// H + KVH heads. q heads sit QS apart (2*HD when each carries its output gate); RoPE turns the first ROT dims.
-/// Defines: H, KVH, HD, QS, ROT, S, EPS, THETA, SCALE.
+/// H + KVH heads. q heads sit QS apart (2*HD when each carries its output gate). RoPE turns ROT dims as pairs
+/// (i, i + PH) for i < ROT/2 at angle pos * THETA^(-2i/ED): Qwen3 (ROT = ED = HD, PH = HD/2), Qwen3.5 partial (ROT = ED
+/// = 64, PH = 32), Gemma 4 proportional (ROT = HD/4, PH = HD/2, ED = HD). VNORM: v gets a weightless RMSNorm (Gemma 4).
+/// Defines: H, KVH, HD, QS, ROT, PH, ED, S, EPS, THETA, SCALE, VNORM.
 pub const QK_ROPE: &str = r#"
 struct Args { int n; int P; };
 kernel void qk_rope(const device float* qkv [[buffer(0)]], const device bfloat* qn [[buffer(1)]], const device bfloat* kn [[buffer(2)]],
@@ -167,16 +200,15 @@ kernel void qk_rope(const device float* qkv [[buffer(0)]], const device bfloat* 
     for (int e = 0; e < E; e++) v[e] = v[e] * r * float(nw[int(lane) + 32 * e]);
     float p = float(pos[row]);
     float o[E];
-    const int ER = ROT / 32;                    // elements per lane that RoPE turns
-    for (int e = 0; e < ER / 2; e++) {          // pair (i, i + ROT/2), i = lane + 32e
+    for (int e = 0; e < E; e++) o[e] = v[e];
+    for (int e = 0; e < ROT / 64; e++) {        // pair (i, i + PH), i = lane + 32e
         int i = int(lane) + 32 * e;
-        float inv = pow(THETA, -2.0f * float(i) / float(ROT));
+        float inv = pow(THETA, -2.0f * float(i) / float(ED));
         float ang = p * inv, c = cos(ang), s = sin(ang);
-        float x1 = v[e], x2 = v[e + ER / 2];
+        float x1 = v[e], x2 = v[e + PH / 32];
         o[e] = x1 * c - x2 * s;
-        o[e + ER / 2] = x2 * c + x1 * s;
+        o[e + PH / 32] = x2 * c + x1 * s;
     }
-    for (int e = ER; e < E; e++) o[e] = v[e];
     if (isq) {
         for (int e = 0; e < E; e++) qo[(row * H + hh) * HD + int(lane) + 32 * e] = o[e] * SCALE;
     } else if (row < a.n) {
@@ -184,7 +216,11 @@ kernel void qk_rope(const device float* qkv [[buffer(0)]], const device bfloat* 
         int slot = a.P + row;
         for (int e = 0; e < E; e++) kc[(kh * S + slot) * HD + int(lane) + 32 * e] = half(o[e]);
         const device float* vs = qkv + row * W + H * QS + (KVH + kh) * HD;
-        for (int e = 0; e < E; e++) vc[(kh * S + slot) * HD + int(lane) + 32 * e] = half(vs[int(lane) + 32 * e]);
+        float vv[E], vss = 0.0f;
+        for (int e = 0; e < E; e++) { vv[e] = vs[int(lane) + 32 * e]; vss += vv[e] * vv[e]; }
+        float vr = 1.0f;
+        if (VNORM) { vss = simd_sum(vss); vr = rsqrt(vss / float(HD) + EPS); }
+        for (int e = 0; e < E; e++) vc[(kh * S + slot) * HD + int(lane) + 32 * e] = half(VNORM ? vv[e] * vr : vv[e]);
     }
 }
 "#;
@@ -304,12 +340,27 @@ kernel void copy_cols(const device float* h [[buffer(0)]], device float* f [[buf
 }
 "#;
 
-/// float rows [n, KD] -> half + group sums (no norm). Defines: KD.
+/// float rows [n, KD] -> half + group sums (no norm). RSC: scale rows past half's range (rs[row]). Defines: KD, RSC.
 pub const PREP: &str = r#"
 kernel void prep(const device float* x [[buffer(0)]], device half* xh [[buffer(1)]], device float* xo [[buffer(2)]],
-                 device float* xs [[buffer(3)]], uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+                 device float* xs [[buffer(3)]], device float* rs [[buffer(4)]],
+                 uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+                 uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     device half* xr = xh + row * KD;
-    for (int i = int(tid); i < KD; i += 256) xr[i] = half(x[row * KD + i]);
+    float sc = 1.0f;
+    if (RSC) {
+        threadgroup float part[8];
+        float mx = 0.0f;
+        for (int i = int(tid); i < KD; i += 256) mx = max(mx, abs(x[row * KD + i]));
+        mx = simd_max(mx);
+        if (lane == 0) part[sg] = mx;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float m = 0.0f;
+        for (int i = 0; i < 8; i++) m = max(m, part[i]);
+        sc = row_scale(m);
+        if (tid == 0) rs[row] = sc;
+    }
+    for (int i = int(tid); i < KD; i += 256) xr[i] = half(RSC ? x[row * KD + i] / sc : x[row * KD + i]);
     threadgroup_barrier(mem_flags::mem_device);
     group_sums(xr, xo + row * (KD / 64), xs + row * (KD / 64), tid, 256, KD);
 }
@@ -499,6 +550,128 @@ kernel void lin_norm(const device float* y [[buffer(0)]], const device float* zb
         }
         xs[row * (HV * G) + hv * G + g] = s_;
         xo[row * (HV * G) + hv * G + g] = o;
+    }
+}
+"#;
+
+/// Gemma 4 sandwich norm: h = (h + RMSNorm(t) * w) * scalar, per row (one threadgroup of 256). Defines: D, EPS.
+pub const ADD_NORM: &str = r#"
+struct NArgs { float scalar; };
+kernel void add_norm(device float* h [[buffer(0)]], const device float* t [[buffer(1)]], const device bfloat* w [[buffer(2)]],
+                     constant NArgs& a [[buffer(3)]],
+                     uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+                     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float part[8];
+    const device float* tr = t + row * D;
+    float ss = 0.0f;
+    for (int i = int(tid); i < D; i += 256) ss += tr[i] * tr[i];
+    ss = simd_sum(ss);
+    if (lane == 0) part[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (int i = 0; i < 8; i++) tot += part[i];
+    float r = rsqrt(tot / float(D) + EPS);
+    device float* hr = h + row * D;
+    for (int i = int(tid); i < D; i += 256) hr[i] = (hr[i] + tr[i] * r * float(w[i])) * a.scalar;
+}
+"#;
+
+/// Gemma 4 per-layer inputs, per (row, layer): RMSNorm(proj * PSCALE) * w, plus the layer's own embedding row, times
+/// 2^-0.5. proj, raw, out: [n][NL*PLE]. One simdgroup each. Defines: NL, PLE, EPS, PSCALE.
+pub const PLE_MIX: &str = r#"
+kernel void ple_mix(const device float* proj [[buffer(0)]], const device float* raw [[buffer(1)]], const device bfloat* w [[buffer(2)]],
+                    device float* out [[buffer(3)]],
+                    uint lane [[thread_index_in_simdgroup]], uint gid [[threadgroup_position_in_grid]]) {
+    int row = int(gid) / NL, l = int(gid) % NL;
+    long base = long(row) * (NL * PLE) + l * PLE;
+    const int E = PLE / 32;
+    float v[E], ss = 0.0f;
+    for (int e = 0; e < E; e++) { v[e] = proj[base + int(lane) + 32 * e] * PSCALE; ss += v[e] * v[e]; }
+    ss = simd_sum(ss);
+    float r = rsqrt(ss / float(PLE) + EPS);
+    for (int e = 0; e < E; e++) {
+        int i = int(lane) + 32 * e;
+        out[base + i] = (v[e] * r * float(w[i]) + raw[base + i]) * 0.7071067811865476f;
+    }
+}
+"#;
+
+/// Gemma 4 per-layer gate: GELU(t) * pl[row][layer] -> half x + group sums (K = PLE). Defines: PLE, NLP (= NL*PLE).
+pub const GELU_MUL_PREP: &str = r#"
+struct GArgs { int layer; };
+kernel void gelu_mul_prep(const device float* t [[buffer(0)]], const device float* pl [[buffer(1)]], device half* xh [[buffer(2)]],
+                          device float* xo [[buffer(3)]], device float* xs [[buffer(4)]], constant GArgs& a [[buffer(5)]],
+                          device float* rs [[buffer(6)]],
+                          uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    device half* xr = xh + row * PLE;
+    threadgroup float part[8];
+    float mx = 0.0f;
+    for (int i = int(tid); i < PLE; i += 256) {
+        float x = t[row * PLE + i];
+        mx = max(mx, abs(gelu_t(x) * pl[long(row) * NLP + a.layer * PLE + i]));
+    }
+    mx = simd_max(mx);
+    if (lane == 0) part[sg] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m = 0.0f;
+    for (int i = 0; i < 8; i++) m = max(m, part[i]);
+    float sc = row_scale(m);   // scaled rows are multiplied back after the projection (rs)
+    if (tid == 0) rs[row] = sc;
+    for (int i = int(tid); i < PLE; i += 256) {
+        float x = t[row * PLE + i];
+        float g = gelu_t(x);
+        xr[i] = half(g * pl[long(row) * NLP + a.layer * PLE + i] / sc);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    group_sums(xr, xo + row * (PLE / 64), xs + row * (PLE / 64), tid, 256, PLE);
+}
+"#;
+
+/// Gemma 4 assistant head, one threadgroup (256) per row: score the NC word clusters against the row's normed hidden
+/// (half x), keep the TOPC best, score their words exactly (bf16 table) -> lg [row][TOPC*PER], ids [row][TOPC*PER].
+/// Defines: AD, NC, PER, TOPC.
+pub const ASST_HEAD: &str = r#"
+kernel void asst_head(const device half* xh [[buffer(0)]], const device bfloat* cent [[buffer(1)]], const device int* order [[buffer(2)]],
+                      const device bfloat* lm [[buffer(3)]], device float* lg [[buffer(4)]], device int* ids [[buffer(5)]],
+                      uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float hv[AD];
+    threadgroup float sc[NC];
+    threadgroup float bv[8];
+    threadgroup int bi[8];
+    threadgroup int pick[TOPC];
+    for (int i = int(tid); i < AD; i += 256) hv[i] = float(xh[row * AD + i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int c = int(tid); c < NC; c += 256) {
+        float s = 0.0f;
+        for (int i = 0; i < AD; i++) s += float(cent[c * AD + i]) * hv[i];
+        sc[c] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int k = 0; k < TOPC; k++) {
+        float b = -INFINITY; int ix = 0x7fffffff;
+        for (int c = int(tid); c < NC; c += 256) if (sc[c] > b) { b = sc[c]; ix = c; }
+        for (int off = 16; off > 0; off /= 2) {
+            float ob = simd_shuffle_down(b, ushort(off)); int oi = simd_shuffle_down(ix, ushort(off));
+            if (ob > b || (ob == b && oi < ix)) { b = ob; ix = oi; }
+        }
+        if (lane == 0) { bv[sg] = b; bi[sg] = ix; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float bb = bv[0]; int ii = bi[0];
+            for (int i = 1; i < 8; i++) if (bv[i] > bb || (bv[i] == bb && bi[i] < ii)) { bb = bv[i]; ii = bi[i]; }
+            pick[k] = ii;
+            sc[ii] = -INFINITY;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int j = int(tid); j < TOPC * PER; j += 256) {
+        int t = order[pick[j / PER] * PER + j % PER];
+        float s = 0.0f;
+        for (int i = 0; i < AD; i++) s += float(lm[long(t) * AD + i]) * hv[i];
+        lg[row * (TOPC * PER) + j] = s;
+        ids[row * (TOPC * PER) + j] = t;
     }
 }
 "#;

@@ -1,9 +1,12 @@
 //! fast-rs: native Metal engine for models that fit in memory (Qwen3 dense first). No MLX, no Python.
 //! One command buffer per pass; every kernel is row-independent, so guess-checking gives exactly plain decoding's words.
 //! Guesser: z-lab DFlash (a block of 16 positions in one pass, reading the target's layer outputs) + best-first tree.
+mod gemma;
 mod kernels;
 mod server;
 mod st;
+
+use gemma::{Asst, G4Cfg, G4M, gemma_layer, read_g4};
 
 use anyhow::{Context, Result, anyhow, bail};
 use objc2::rc::Retained;
@@ -197,6 +200,44 @@ struct Layer {
     kc: Buf,
     vc: Buf,
     lin: Option<Lin>, // Gated DeltaNet layer (Qwen3.5): qkv = [in_proj_qkv | z | b | a], o = out_proj
+    at: At,           // this layer's attention shape
+    g4: Option<G4L>,  // Gemma 4: sandwich norms, per-layer input, layer scalar
+}
+
+/// One attention layer's shape. Gemma 4 mixes sliding layers (head 256) with full ones (head 512) and lets later
+/// layers read an earlier layer's memory (src) instead of writing their own (kvh_w = 0).
+#[derive(Clone)]
+struct At {
+    h: usize,      // query heads
+    hd: usize,     // head size
+    kvh_w: usize,  // key/value heads this layer writes (0: it reads layer src's)
+    kvh: usize,    // key/value heads it reads
+    src: usize,    // layer whose memory it reads
+    w: usize,      // sliding window (0: all)
+    theta: f32,
+    rot: usize,    // RoPE: dims turned, pair distance, exponent denominator (see QK_ROPE)
+    ph: usize,
+    ed: usize,
+    scale: f32,
+    vnorm: bool,
+    qs: usize,     // q head stride in the projection (2*hd with an output gate)
+    gate: bool,
+}
+
+impl At {
+    fn qwen(c: &Cfg, i: usize) -> At {
+        At { h: c.h, hd: c.hd, kvh_w: c.kvh, kvh: c.kvh, src: i, w: 0, theta: c.theta, rot: c.rot, ph: c.rot / 2, ed: c.rot,
+             scale: (c.hd as f32).powf(-0.5), vnorm: false, qs: c.qs(), gate: c.gate }
+    }
+    fn qkvw(&self) -> usize { self.h * self.qs + 2 * self.kvh_w * self.hd }
+}
+
+/// Gemma 4 layer extras. post_n of the Layer is its pre-feedforward norm.
+struct G4L {
+    pa_n: Buf,          // after attention
+    po_n: Buf,          // after the MLP
+    ple: Option<(QW, QW, Buf)>, // per-layer input: gate (d -> ple), projection (ple -> d), norm after it
+    scalar: f32,
 }
 
 /// A linear-attention layer's own weights and memory: a running state per value head instead of a key/value list.
@@ -238,6 +279,7 @@ struct Cfg {
     gate: bool,            // attention output gate in the q projection (Qwen3.5)
     lin: Option<LinCfg>,
     linear: Vec<bool>,     // per layer: linear attention?
+    gemma: Option<G4Cfg>,  // Gemma 4
 }
 
 impl Cfg {
@@ -321,9 +363,14 @@ fn zero(b: &Buf) {
     unsafe { std::ptr::write_bytes(b.contents().as_ptr() as *mut u8, 0, b.length()) };
 }
 
-fn merge_defs(c: &Cfg, nb: usize) -> Vec<(&'static str, String)> {
-    vec![("H", c.h.to_string()), ("D", c.hd.to_string()), ("NB", nb.to_string()), ("GATE", (c.gate as i32).to_string()),
-         ("QS", c.qs().to_string()), ("QW", (c.h * c.qs() + 2 * c.kvh * c.hd).to_string())]
+fn merge_defs(a: &At, nb: usize) -> Vec<(&'static str, String)> {
+    vec![("H", a.h.to_string()), ("D", a.hd.to_string()), ("NB", nb.to_string()), ("GATE", (a.gate as i32).to_string()),
+         ("QS", a.qs.to_string()), ("QW", a.qkvw().to_string())]
+}
+
+fn split_defs(a: &At, maxlen: usize, nb: usize) -> Vec<(&'static str, String)> {
+    vec![("H", a.h.to_string()), ("KVH", a.kvh.to_string()), ("D", a.hd.to_string()), ("S", maxlen.to_string()), ("W", a.w.to_string()),
+         ("MAXD", MAXD.to_string()), ("BS", BS.to_string()), ("NB", nb.to_string())]
 }
 
 fn read_cfg(c: &serde_json::Value) -> Cfg {
@@ -349,6 +396,7 @@ fn read_cfg(c: &serde_json::Value) -> Cfg {
         lin: linear.iter().any(|&x| x).then(|| LinCfg { hk: f("linear_num_key_heads") as usize, hv: f("linear_num_value_heads") as usize,
             dk: f("linear_key_head_dim") as usize, dv: f("linear_value_head_dim") as usize }),
         linear,
+        gemma: read_g4(c),
     }
 }
 
@@ -384,7 +432,13 @@ fn load_stack(gpu: &Gpu, w: &Weights, cfg: &Cfg, n_layers: usize, pre: &str, nor
                     tail: gpu.buf(3 * lc.c() * 4),
                     keep: gpu.buf(MAXD * lc.ks() * 4),
                 }),
+                at: At::qwen(cfg, i),
+                g4: None,
             });
+            continue;
+        }
+        if cfg.gemma.is_some() {
+            layers.push(gemma_layer(gpu, w, cfg, i, &p, maxlen)?);
             continue;
         }
         layers.push(Layer {
@@ -400,6 +454,8 @@ fn load_stack(gpu: &Gpu, w: &Weights, cfg: &Cfg, n_layers: usize, pre: &str, nor
             kc: gpu.buf(kvbytes),
             vc: gpu.buf(kvbytes),
             lin: None,
+            at: At::qwen(cfg, i),
+            g4: None,
         });
     }
     Ok(Stack { cfg: cfg.clone(), layers, norm: gpu.buf_from(w.u16s(norm)?) })
@@ -461,6 +517,15 @@ struct Model {
     pub turn_tok: Option<i32>, // chat turn marker (<|im_start|>): hybrid models snapshot their state after the last one
     snap: Option<(usize, Vec<Vec<u8>>)>, // (position, linear layers' state + tail) at the last turn boundary
     pub kept: usize,     // words of the last prompt whose memory was reused
+    g4m: Option<G4M>,    // Gemma 4 per-layer inputs
+    asst: Option<Asst>,  // Gemma 4 assistant (guesser)
+    hrows: Vec<f32>,     // last pass's final hidden rows (before the norm), for the assistant
+    last_hn: Vec<f32>,   // normed hidden of the last committed word: the assistant's starting point
+    tmp: Buf,            // [rows][d] scratch (Gemma: block outputs before their norm)
+    tmp2: Buf,           // [rows][ple]
+    rscale: Buf,         // [rows]: power-of-two input scale of the last prep (rows past half's range)
+    rs_next: bool,       // the next matmul multiplies its rows back by rscale
+    pub prof: [f64; 4],  // assistant: GPU wait s, CPU head s, rounds
 }
 
 impl Model {
@@ -480,9 +545,16 @@ impl Model {
         let t = load_stack(&gpu, &w, &cfg, cfg.linear.len(), &format!("{lm}model."), &format!("{lm}model.norm.weight"), maxlen, false)?;
         let tie = tc["tie_word_embeddings"].as_bool().or(c["tie_word_embeddings"].as_bool()).unwrap_or(false);
         let head = repack(&gpu, &[if tie { w.q4(&epre)? } else { w.q4(&format!("{lm}lm_head"))? }], cfg.d);
-        let g = match guesser {
+        let g4m = if cfg.gemma.is_some() { Some(G4M::load(&gpu, &w, lm, &cfg, MAXR)?) } else { None };
+        let gconf: Option<serde_json::Value> = match guesser {
+            Some(gd) => Some(serde_json::from_str(&std::fs::read_to_string(gd.join("config.json"))?)?),
+            None => None,
+        };
+        let is_asst = gconf.as_ref().map(|c| c["model_type"].as_str() == Some("gemma4_assistant")).unwrap_or(false);
+        let asst = if is_asst { Some(Asst::load(&gpu, guesser.unwrap(), &t)?) } else { None };
+        let g = match guesser.filter(|_| !is_asst) {
             Some(gd) => {
-                let gc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(gd.join("config.json"))?)?;
+                let gc = gconf.clone().unwrap();
                 let gcfg = read_cfg(&gc);
                 let gw = Weights::open(gd)?;
                 let tl: Vec<usize> = gc["dflash_config"]["target_layer_ids"].as_array().context("target_layer_ids")?
@@ -506,10 +578,18 @@ impl Model {
         let r = MAXR;
         let nf = g.as_ref().map(|g| g.target_layers.len()).unwrap_or(1);
         let lc = cfg.lin.unwrap_or(LinCfg { hk: 0, hv: 0, dk: 0, dv: 0 });
-        let qkvw = (cfg.h * cfg.qs() + 2 * cfg.kvh * cfg.hd).max(lc.c());
-        let qw = (cfg.h * cfg.hd).max(lc.hv * lc.dv);
-        let xw = cfg.d.max(cfg.inter).max(qw).max(nf * cfg.d);
-        let guw = (2 * cfg.inter).max(lc.nlin());
+        // scratch sizes: the widest of every layer kind (target, guesser stack, assistant)
+        let mut all: Vec<&Layer> = t.layers.iter().filter(|l| l.lin.is_none()).collect();
+        if let Some(g) = &g { all.extend(g.stack.layers.iter()); }
+        if let Some(a) = &asst { all.extend(a.layers.iter()); }
+        let qkvw = all.iter().map(|l| l.qkv.n).max().unwrap_or(0).max(lc.c());
+        let qw = all.iter().map(|l| l.at.h * l.at.hd).max().unwrap_or(0).max(lc.hv * lc.dv);
+        let ple = cfg.gemma.as_ref().map(|g| g.ple).unwrap_or(0);
+        let xw = cfg.d.max(cfg.inter).max(qw).max(nf * cfg.d).max(all.iter().map(|l| l.down.k.max(l.o.k)).max().unwrap_or(0))
+            .max(2 * cfg.d).max(ple.max(64));
+        let guw = all.iter().map(|l| l.gu.n).max().unwrap_or(0).max(lc.nlin());
+        let partw = all.iter().map(|l| l.at.h * (l.at.hd + 2)).max().unwrap_or(0);
+        let (tmp, tmp2, rsb) = (gpu.buf(r * cfg.d * 4), gpu.buf(r * ple.max(64) * 4), gpu.buf(r * 4));
         Ok(Model {
             emb_w: gpu.buf(r * cfg.d / 2),
             emb_s: gpu.buf(r * cfg.d / 64 * 2),
@@ -534,7 +614,7 @@ impl Model {
             xs: gpu.buf(r * xw / 64 * 4),
             qkv: gpu.buf(r * qkvw * 4),
             q: gpu.buf(r * qw * 4),
-            part: gpu.buf(r * cfg.h * nbmax * (cfg.hd + 2) * 4),
+            part: gpu.buf(r * nbmax * partw * 4),
             gu: gpu.buf(r * guw * 4),
             feats: gpu.buf(r * nf * cfg.d * 4),
             logits: gpu.buf(16 * cfg.vocab * 4),
@@ -555,6 +635,15 @@ impl Model {
             turn_tok: None,
             snap: None,
             kept: 0,
+            g4m,
+            asst,
+            hrows: Vec::new(),
+            last_hn: Vec::new(),
+            tmp,
+            tmp2,
+            rscale: rsb,
+            rs_next: false,
+            prof: [0.0; 4],
         })
     }
 
@@ -648,15 +737,16 @@ impl Model {
                 for add in [false, true] {
                     let (nt, sk) = self.cfg_for(w.n, w.k, rows / 8);
                     self.gpu.pipe("qmm", kernels::QMM, &[("M", rows.to_string()), ("MT", (rows / 8).to_string()), ("K", w.k.to_string()),
-                        ("N", w.n.to_string()), ("NT", nt.to_string()), ("SK", sk.to_string()), ("ADD", (add as i32).to_string())])?;
+                        ("N", w.n.to_string()), ("NT", nt.to_string()), ("SK", sk.to_string()), ("ADD", (add as i32).to_string()), ("RS", "0".into())])?;
                 }
             }
         }
-        let c = self.t.cfg.clone();
+        let ats: Vec<At> = self.t.layers.iter().filter(|l| l.lin.is_none()).map(|l| l.at.clone()).collect();
         for nb in 1..=(self.maxlen + MAXD).div_ceil(BS) {
-            self.gpu.pipe("attn_split", kernels::ATTN_SPLIT, &[("H", c.h.to_string()), ("KVH", c.kvh.to_string()), ("D", c.hd.to_string()),
-                ("S", self.maxlen.to_string()), ("W", "0".into()), ("MAXD", MAXD.to_string()), ("BS", BS.to_string()), ("NB", nb.to_string())])?;
-            self.gpu.pipe("attn_merge", kernels::ATTN_MERGE, &merge_defs(&c, nb))?;
+            for a in &ats {
+                self.gpu.pipe("attn_split", kernels::ATTN_SPLIT, &split_defs(a, self.maxlen, nb))?;
+                self.gpu.pipe("attn_merge", kernels::ATTN_MERGE, &merge_defs(a, nb))?;
+            }
         }
         eprintln!("compiled {} kernel variants in {:.1}s", self.gpu.pipes.len(), t0.elapsed().as_secs_f64());
         Ok(())
@@ -736,10 +826,11 @@ impl Model {
             bail!("qmm rows > 128");
         }
         let mt = rows / 8;
+        let rs = std::mem::take(&mut self.rs_next);
         let p = self.gpu.pipe("qmm", kernels::QMM, &[("M", rows.to_string()), ("MT", mt.to_string()), ("K", w.k.to_string()),
-            ("N", w.n.to_string()), ("NT", nt.to_string()), ("SK", sk.to_string()), ("ADD", (add as i32).to_string())])?;
+            ("N", w.n.to_string()), ("NT", nt.to_string()), ("SK", sk.to_string()), ("ADD", (add as i32).to_string()), ("RS", (rs as i32).to_string())])?;
         e.setComputePipelineState(&p);
-        bind(e, &[x[0], x[1], x[2], &w.wq, &w.sp, &w.bp, out]);
+        bind(e, &[x[0], x[1], x[2], &w.wq, &w.sp, &w.bp, out, &self.rscale]);
         if r0 > 0 {
             unsafe {
                 e.setBuffer_offset_atIndex(Some(x[0]), r0 * w.k * 2, 0);
@@ -761,21 +852,23 @@ impl Model {
     }
 
     fn enc_rope(&mut self, e: &Enc, c: &Cfg, heads: usize, src: &Buf, layer: &Layer, n_real: usize, p0: usize, n: usize, pos: &Buf) -> Result<()> {
-        let p = self.gpu.pipe("qk_rope", kernels::QK_ROPE, &[("H", heads.to_string()), ("KVH", c.kvh.to_string()), ("HD", c.hd.to_string()),
-            ("QS", c.qs().to_string()), ("ROT", c.rot.to_string()),
-            ("S", self.maxlen.to_string()), ("EPS", format!("{:e}f", c.eps)), ("THETA", format!("{:e}f", c.theta)),
-            ("SCALE", format!("{:e}f", (c.hd as f32).powf(-0.5)))])?;
+        let a = &layer.at;
+        let p = self.gpu.pipe("qk_rope", kernels::QK_ROPE, &[("H", heads.to_string()), ("KVH", a.kvh_w.to_string()), ("HD", a.hd.to_string()),
+            ("QS", a.qs.to_string()), ("ROT", a.rot.to_string()), ("PH", a.ph.to_string()), ("ED", a.ed.to_string()), ("VNORM", (a.vnorm as i32).to_string()),
+            ("S", self.maxlen.to_string()), ("EPS", format!("{:e}f", c.eps)), ("THETA", format!("{:e}f", a.theta)),
+            ("SCALE", format!("{:e}f", a.scale))])?;
         e.setComputePipelineState(&p);
         let q = self.q.clone();
         bind(e, &[src, &layer.qn, &layer.kn, pos, &q, &layer.kc, &layer.vc]);
         let args: [i32; 2] = [n_real as i32, p0 as i32];
         unsafe { e.setBytes_length_atIndex(NonNull::new(args.as_ptr() as *mut c_void).unwrap(), 8, 7) };
-        e.dispatchThreadgroups_threadsPerThreadgroup(sz(n * (heads + c.kvh)), sz(32));
+        e.dispatchThreadgroups_threadsPerThreadgroup(sz(n * (heads + a.kvh_w)), sz(32));
         Ok(())
     }
 
     fn enc_embed(&mut self, e: &Enc, d: usize, n: usize) -> Result<()> {
-        let p = self.gpu.pipe("embed", kernels::EMBED, &[("D", d.to_string())])?;
+        let escale = self.t.cfg.gemma.as_ref().map(|_| (d as f32).sqrt()).unwrap_or(1.0);
+        let p = self.gpu.pipe("embed", kernels::EMBED, &[("D", d.to_string()), ("ESCALE", format!("{escale:e}f"))])?;
         e.setComputePipelineState(&p);
         let ids: Vec<i32> = read(&self.ids, n);
         let ep = &self.epre;
@@ -797,45 +890,64 @@ impl Model {
     fn enc_stack(&mut self, e: &Enc, s: &Stack, n: usize, n_real: usize, p0: usize, span: usize, cap: &[usize]) -> Result<()> {
         let c = s.cfg.clone();
         let nb = (span.min(self.maxlen) + MAXD).div_ceil(BS);
-        let p_split = self.gpu.pipe("attn_split", kernels::ATTN_SPLIT, &[("H", c.h.to_string()), ("KVH", c.kvh.to_string()), ("D", c.hd.to_string()),
-            ("S", self.maxlen.to_string()), ("W", "0".into()), ("MAXD", MAXD.to_string()), ("BS", BS.to_string()), ("NB", nb.to_string())])?;
-        let p_merge = self.gpu.pipe("attn_merge", kernels::ATTN_MERGE, &merge_defs(&c, nb))?;
-        let p_swi = self.gpu.pipe("swiglu_prep", kernels::SWIGLU_PREP, &[("I", c.inter.to_string())])?;
-        let p_copy = self.gpu.pipe("copy_cols", kernels::COPY_COLS, &[("D", c.d.to_string()), ("NBLK", cap.len().max(1).to_string())])?;
-        let b = [self.h.clone(), self.xh.clone(), self.xo.clone(), self.xs.clone(), self.qkv.clone(), self.q.clone(), self.part.clone(),
-                 self.gu.clone(), self.rows.clone(), self.anc.clone(), self.feats.clone()];
-        let [h, xh, xo, xs, qkv, q, part, gu, rows, anc, feats] = &b;
+        let p_swi = self.gpu.pipe("swiglu_prep", kernels::SWIGLU_PREP, &[("I", c.inter.to_string()), ("GELU", "0".into())])?;
+        let b = [self.h.clone(), self.xh.clone(), self.xo.clone(), self.xs.clone(), self.qkv.clone(), self.gu.clone()];
+        let [h, xh, xo, xs, qkv, gu] = &b;
         for (li, l) in s.layers.iter().enumerate() {
             self.enc_norm(e, c.d, c.eps, h, &l.in_n, n)?;
+            if l.g4.is_some() {
+                let src = &s.layers[l.at.src];
+                self.enc_gemma_layer(e, &c, l, (&src.kc, &src.vc), li, n, n_real, p0, nb)?;
+                if let Some(j) = cap.iter().position(|&x| x == li) {
+                    self.enc_copy(e, c.d, j, cap.len(), n)?;
+                }
+                continue;
+            }
             if let Some(lin) = &l.lin {
                 self.enc_lin(e, &c, l, lin, n, n_real)?;
             } else {
                 self.enc_qmm(e, &l.qkv, [xh, xo, xs], qkv, n, false)?;
                 let pos = self.pos.clone();
-                self.enc_rope(e, &c, c.h, qkv, l, n_real, p0, n, &pos)?;
-                e.setComputePipelineState(&p_split);
-                bind(e, &[q, &l.kc, &l.vc, rows, anc, part]);
-                e.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: n * c.h, height: nb, depth: 1 }, sz(32));
-                e.setComputePipelineState(&p_merge);
-                bind(e, &[part, xh, xo, xs, qkv]);
-                e.dispatchThreadgroups_threadsPerThreadgroup(sz(n * c.h), sz(32));
+                self.enc_rope(e, &c, l.at.h, qkv, l, n_real, p0, n, &pos)?;
+                self.enc_attn(e, &l.at, (&l.kc, &l.vc), n, nb)?;
                 self.enc_qmm(e, &l.o, [xh, xo, xs], h, n, true)?;
             }
             self.enc_norm(e, c.d, c.eps, h, &l.post_n, n)?;
             self.enc_qmm(e, &l.gu, [xh, xo, xs], gu, n, false)?;
             e.setComputePipelineState(&p_swi);
-            bind(e, &[gu, xh, xo, xs]);
+            bind(e, &[gu, xh, xo, xs, &self.rscale]);
             e.dispatchThreadgroups_threadsPerThreadgroup(sz(n), sz(256));
             self.enc_qmm(e, &l.down, [xh, xo, xs], h, n, true)?;
             if let Some(j) = cap.iter().position(|&x| x == li) {
-                e.setComputePipelineState(&p_copy);
-                bind(e, &[h, feats]);
-                let a: [i32; 1] = [j as i32];
-                unsafe { e.setBytes_length_atIndex(NonNull::new(a.as_ptr() as *mut c_void).unwrap(), 4, 2) };
-                e.dispatchThreads_threadsPerThreadgroup(MTLSize { width: c.d, height: n, depth: 1 }, sz(256));
+                self.enc_copy(e, c.d, j, cap.len(), n)?;
             }
         }
         self.enc_norm(e, c.d, c.eps, h, &s.norm, n)
+    }
+
+    /// Attention of the n rows' q (self.q) over memory `kv`, merged into xh/xo/xs for the o-projection.
+    fn enc_attn(&mut self, e: &Enc, a: &At, kv: (&Buf, &Buf), n: usize, nb: usize) -> Result<()> {
+        let p_split = self.gpu.pipe("attn_split", kernels::ATTN_SPLIT, &split_defs(a, self.maxlen, nb))?;
+        let p_merge = self.gpu.pipe("attn_merge", kernels::ATTN_MERGE, &merge_defs(a, nb))?;
+        let b = [self.q.clone(), self.rows.clone(), self.anc.clone(), self.part.clone(), self.xh.clone(), self.xo.clone(), self.xs.clone(), self.qkv.clone()];
+        let [q, rows, anc, part, xh, xo, xs, qkv] = &b;
+        e.setComputePipelineState(&p_split);
+        bind(e, &[q, kv.0, kv.1, rows, anc, part]);
+        e.dispatchThreadgroups_threadsPerThreadgroup(MTLSize { width: n * a.h, height: nb, depth: 1 }, sz(32));
+        e.setComputePipelineState(&p_merge);
+        bind(e, &[part, xh, xo, xs, qkv]);
+        e.dispatchThreadgroups_threadsPerThreadgroup(sz(n * a.h), sz(32));
+        Ok(())
+    }
+
+    /// h -> column block j of self.feats (layer outputs a DFlash guesser reads).
+    fn enc_copy(&mut self, e: &Enc, d: usize, j: usize, nblk: usize, n: usize) -> Result<()> {
+        let p = self.gpu.pipe("copy_cols", kernels::COPY_COLS, &[("D", d.to_string()), ("NBLK", nblk.max(1).to_string())])?;
+        e.setComputePipelineState(&p);
+        bind(e, &[&self.h, &self.feats]);
+        set_args(e, &[j as i32], 2);
+        e.dispatchThreads_threadsPerThreadgroup(MTLSize { width: d, height: n, depth: 1 }, sz(256));
+        Ok(())
     }
 
     /// Linear layer (Gated DeltaNet) over the n rows prepared in xh: projections, conv, delta rule, gated norm,
@@ -926,6 +1038,9 @@ impl Model {
         let cb = self.gpu.queue.commandBuffer().context("cb")?;
         let e = cb.computeCommandEncoder().context("enc")?;
         self.enc_embed(&e, d, n)?;
+        if self.g4m.is_some() {
+            self.enc_ple(&e, n)?;
+        }
         self.enc_stack(&e, t, n, n_real, self.p, self.p + n_real, &cap)?;
         let head = unsafe { &*(&self.head as *const QW) };
         let (xh, xo, xs, logits, pick) = (self.xh.clone(), self.xo.clone(), self.xs.clone(), self.logits.clone(), self.pick.clone());
@@ -938,11 +1053,17 @@ impl Model {
             e.endEncoding();
             cb.commit();
             cb.waitUntilCompleted();
+            if self.asst.is_some() {
+                self.hrows = read(&self.h, n_real * d);
+            }
             return Ok(read(&self.pick, n_real));
         }
         e.endEncoding();
         cb.commit();
         cb.waitUntilCompleted();
+        if self.asst.is_some() {
+            self.hrows = read(&self.h, n_real * d);
+        }
         // the last row's prepared input -> rows 0..8 of small head buffers
         let g = d / 64;
         let r = n_real - 1;
@@ -1001,9 +1122,9 @@ impl Model {
             let fb = self.gpu.buf_from(&chunk);
             let pos: Vec<i32> = (0..n).map(|i| (g.c + i) as i32).collect();
             let posb = self.gpu.buf_from(&pos);  // own buffer: the block below rewrites self.pos before the GPU runs
-            let p_prep = self.gpu.pipe("prep", kernels::PREP, &[("KD", f.to_string())])?;
+            let p_prep = self.gpu.pipe("prep", kernels::PREP, &[("KD", f.to_string()), ("RSC", "0".into())])?;
             e.setComputePipelineState(&p_prep);
-            bind(&e, &[&fb, &xh, &xo, &xs]);
+            bind(&e, &[&fb, &xh, &xo, &xs, &self.rscale]);
             e.dispatchThreadgroups_threadsPerThreadgroup(sz(n), sz(256));
             self.enc_qmm(&e, &g.fc, [&xh, &xo, &xs], &h, n, false)?;
             self.enc_norm(&e, gc.d, gc.eps, &h, &g.hidden_norm, n)?;
@@ -1124,6 +1245,9 @@ impl Model {
             let rows: Vec<[i32; 4]> = pos.iter().map(|&p| [p, p + 1, 0, 0]).collect();
             last = self.forward(c, &pos, &rows, &vec![[0i32; MAXD]; n], false)?[0];
             self.keep_features(&(0..n).collect::<Vec<_>>());
+            if self.asst.is_some() {
+                self.last_hn = self.hidden_row(n - 1);
+            }
             self.p += n;
             self.hist.extend_from_slice(c);
         }
@@ -1172,12 +1296,11 @@ impl Model {
 
     /// Move accepted tree rows (slots P + node) to P..P+a-1 in every target layer's memory (CPU, shared buffers).
     fn commit(&mut self, acc: &[usize]) -> Result<()> {
-        let c = &self.t.cfg;
-        let row_bytes = c.hd * 2;
-        for l in self.t.layers.iter().filter(|l| l.lin.is_none()) {
+        for l in self.t.layers.iter().filter(|l| l.lin.is_none() && l.at.kvh_w > 0) {
+            let row_bytes = l.at.hd * 2;
             for b in [&l.kc, &l.vc] {
                 let base = b.contents().as_ptr() as *mut u8;
-                for kh in 0..c.kvh {
+                for kh in 0..l.at.kvh_w {
                     for (i, &node) in acc.iter().enumerate() {
                         if node != i {
                             unsafe {
@@ -1265,7 +1388,13 @@ impl Model {
         }
         while n_out < max_new && !eos.contains(&y) {
             let td = Instant::now();
-            let (toks, parent) = if self.g.is_some() { self.build_tree(y, budget)? } else { (vec![y], vec![-1]) };
+            let (toks, parent) = if self.asst.is_some() {
+                self.build_tree_asst(y, budget)?
+            } else if self.g.is_some() {
+                self.build_tree(y, budget)?
+            } else {
+                (vec![y], vec![-1])
+            };
             self.draft_s += td.elapsed().as_secs_f64();
             let n = toks.len();
             let mut depth = vec![0usize; n];
@@ -1311,6 +1440,9 @@ impl Model {
                 self.hist.push(toks[a]);
             }
             self.keep_features(&acc);
+            if self.asst.is_some() {
+                self.last_hn = self.hidden_row(*acc.last().unwrap());
+            }
             let tc = Instant::now();
             self.commit(&acc)?;
             self.commit_s += tc.elapsed().as_secs_f64();
@@ -1423,10 +1555,15 @@ fn main() -> Result<()> {
         let same_py = plain.iter().zip(&reference).take_while(|(a, b)| a == b).count();
         dump.insert(name.to_string(), serde_json::json!(plain));
         let mut line = format!("{name:10} plain {:5.1} w/s (= Python {same_py}/{})", plain.len() as f64 / tp, reference.len().min(plain.len()));
-        if m.g.is_some() {
+        if m.g.is_some() || m.asst.is_some() {
             for &b in &budgets {
                 m.tree(&ids, 16, &eos, b)?; // warm up this tree size
+                m.prof = [0.0; 4];
                 let (tree, tt, passes) = m.tree(&ids, max_new, &eos, b)?;
+                if m.asst.is_some() {
+                    eprintln!("  assistant per pass: {:.1} rounds, GPU {:.1} ms, CPU head {:.1} ms", m.prof[2] / passes as f64,
+                              m.prof[0] / passes as f64 * 1e3, m.prof[1] / passes as f64 * 1e3);
+                }
                 line += &format!(" | tree{b}: {:5.1} w/s {:.2} w/chk (guess {:.1} + check {:.1} ms, commit {:.1}) {}", tree.len() as f64 / tt,
                     tree.len() as f64 / passes as f64, m.draft_s / passes as f64 * 1e3, (tt - m.draft_s) / passes as f64 * 1e3,
                     m.commit_s / passes as f64 * 1e3,
