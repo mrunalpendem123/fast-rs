@@ -69,6 +69,7 @@ fn engine(model: PathBuf, guesser: Option<PathBuf>, rx: Receiver<Job>, ready: Se
         .get_ids().iter().map(|&x| x as i32).collect();
     m.generate(&warm, 8, &eos, budget, &mut |_| true)?;
     m.reuse = true; // follow-up messages keep the memory of the conversation so far (exact: same words as rereading it)
+    m.turn_tok = tok.token_to_id("<|im_start|>").map(|x| x as i32);
     let _ = ready.send(model.file_name().unwrap().to_string_lossy().to_string());
     while let Ok(job) = rx.recv() {
         let r = (|| -> Result<()> {

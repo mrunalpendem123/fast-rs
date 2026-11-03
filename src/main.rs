@@ -458,6 +458,9 @@ struct Model {
     tune: HashMap<String, (usize, usize)>,
     want_depth: usize,   // deepest tree level the next guess needs (budget - 1)
     pub reuse: bool,     // keep the memory of words a new prompt shares with the previous conversation
+    pub turn_tok: Option<i32>, // chat turn marker (<|im_start|>): hybrid models snapshot their state after the last one
+    snap: Option<(usize, Vec<Vec<u8>>)>, // (position, linear layers' state + tail) at the last turn boundary
+    pub kept: usize,     // words of the last prompt whose memory was reused
 }
 
 impl Model {
@@ -549,6 +552,9 @@ impl Model {
             tune: HashMap::new(),
             want_depth: 15,
             reuse: false,
+            turn_tok: None,
+            snap: None,
+            kept: 0,
         })
     }
 
@@ -684,6 +690,7 @@ impl Model {
     fn reset(&mut self) {
         self.p = 0;
         self.hist.clear();
+        self.snap = None;
         for l in &self.t.layers {
             if let Some(lin) = &l.lin {
                 zero(&lin.state);
@@ -1123,6 +1130,31 @@ impl Model {
         Ok(last)
     }
 
+    /// Copy the linear layers' committed state and conv tail (hybrid models), to continue a later prompt from here.
+    fn take_snap(&mut self) {
+        let mut v = Vec::new();
+        for l in &self.t.layers {
+            if let Some(lin) = &l.lin {
+                for b in [&lin.state, &lin.tail] {
+                    v.push(unsafe { std::slice::from_raw_parts(b.contents().as_ptr() as *const u8, b.length()) }.to_vec());
+                }
+            }
+        }
+        self.snap = Some((self.p, v));
+    }
+
+    fn restore_snap(&mut self) {
+        let Some((_, v)) = &self.snap else { return };
+        let mut it = v.iter();
+        for l in &self.t.layers {
+            if let Some(lin) = &l.lin {
+                for b in [&lin.state, &lin.tail] {
+                    write(b, it.next().unwrap());
+                }
+            }
+        }
+    }
+
     fn plain(&mut self, prompt: &[i32], max_new: usize, eos: &[i32]) -> Result<(Vec<i32>, f64)> {
         self.reset();
         let mut y = self.feed(prompt)?;
@@ -1196,13 +1228,35 @@ impl Model {
     pub fn generate(&mut self, prompt: &[i32], max_new: usize, eos: &[i32], budget: usize,
                     on_words: &mut dyn FnMut(&[i32]) -> bool) -> Result<(f64, usize)> {
         let mut keep = if self.reuse { self.shared_prefix(prompt) } else { 0 };
-        if self.t.cfg.lin.is_some() && keep != self.hist.len() {
-            keep = 0; // a running state can only be continued, not cut back
+        let hybrid = self.t.cfg.lin.is_some();
+        if hybrid && keep != self.hist.len() {
+            // a running state can only be continued, or restored from the snapshot at the last turn boundary (where the
+            // next prompt's history departs from this one: the template rewrites the answer's think block)
+            match self.snap.as_ref().map(|s| s.0) {
+                Some(sp) if sp > 0 && keep >= sp => {
+                    keep = sp;
+                    self.restore_snap();
+                }
+                _ => keep = 0,
+            }
         }
         self.rewind(keep);
+        self.kept = keep;
         self.draft_s = 0.0;
         self.commit_s = 0.0;
-        let mut y = self.feed(&prompt[keep..])?;
+        // hybrid + reuse: read the prompt up to just after its last "<|im_start|>assistant\n", snapshot, read the rest
+        let cut = match (hybrid && self.reuse, self.turn_tok) {
+            (true, Some(tt)) => prompt.iter().rposition(|&x| x == tt).map(|i| i + 3).filter(|&b| b > keep && b < prompt.len()),
+            _ => None,
+        };
+        let mut y = match cut {
+            Some(b) => {
+                self.feed(&prompt[keep..b])?;
+                self.take_snap();
+                self.feed(&prompt[b..])?
+            }
+            None => self.feed(&prompt[keep..])?,
+        };
         let mut n_out = 1;
         let mut passes = 0;
         let t = Instant::now();
@@ -1610,16 +1664,17 @@ fn prefixtest(a: &[String]) -> Result<()> {
         let mut rec = Vec::new();
         m.reset();
         m.reuse = true;
+        m.turn_tok = tok.token_to_id("<|im_start|>").map(|x| x as i32);
         for (k, turn) in turns.iter().enumerate() {
             msgs.push(serde_json::json!({"role": "user", "content": turn}));
             let ids = enc(&msgs)?;
             if ids.len() + max_new + 64 > 6144 {
                 break;
             }
-            let kept = m.shared_prefix(&ids);
             let t = Instant::now();
             let mut out = Vec::new();
             m.generate(&ids, max_new, &eos, 8, &mut |w| { out.extend_from_slice(w); true })?;
+            let kept = m.kept;
             let tr = t.elapsed().as_secs_f64();
             let ans: Vec<u32> = out.iter().filter(|x| !eos.contains(x)).map(|&x| x as u32).collect();
             msgs.push(serde_json::json!({"role": "assistant", "content": tok.decode(&ans, true).unwrap_or_default()}));
