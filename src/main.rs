@@ -343,6 +343,7 @@ struct Model {
     pub draft_s: f64,
     tune: HashMap<String, (usize, usize)>,
     want_depth: usize,   // deepest tree level the next guess needs (budget - 1)
+    lookup: (usize, usize, usize, f32), // prompt lookup (longest match, guessed words, shortest match, log-score of a word the guesser didn't rank); (0, ..) = off. Env LOOKUP=n,len,min,pen
 }
 
 impl Model {
@@ -415,6 +416,11 @@ impl Model {
             draft_s: 0.0,
             tune: HashMap::new(),
             want_depth: 15,
+            lookup: std::env::var("LOOKUP").ok().map(|v| {
+                let f: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                let g = |i: usize, d: f32| *f.get(i).unwrap_or(&d);
+                (g(0, 4.0) as usize, g(1, 7.0) as usize, g(2, 3.0) as usize, g(3, -2.0))
+            }).unwrap_or((0, 0, 0, 0.0)),
         })
     }
 
@@ -849,14 +855,34 @@ impl Model {
                 }
             }
         }
-        // breadth-first order (parents before children; slots = P + index)
-        let mut order: Vec<usize> = (0..toks.len()).collect();
-        order.sort_by_key(|&i| (dep[i], i));
-        let mut new = vec![0usize; toks.len()];
-        for (j, &o) in order.iter().enumerate() {
-            new[o] = j;
+        if self.lookup.0 > 0 {
+            if let Some(chain) = self.lookup_chain(root) {
+                merge_chain(&mut toks, &mut parent, &mut dep, &mut score, &chain, budget, &top, self.lookup.3);
+            }
         }
-        Ok((order.iter().map(|&o| toks[o]).collect(), order.iter().map(|&o| if parent[o] >= 0 { new[parent[o] as usize] as i32 } else { -1 }).collect()))
+        Ok(bfs(&toks, &parent, &dep))
+    }
+
+    /// Prompt lookup: the newest earlier place where the last n words (n = LOOKUP_N down to 2) also occur; the words
+    /// that followed there, up to LOOKUP_LEN, are a guess for what follows now.
+    fn lookup_chain(&self, root: i32) -> Option<Vec<i32>> {
+        let (max_n, len, min_n, _) = self.lookup;
+        let h = &self.hist;
+        let mut ctx = h[h.len().saturating_sub(max_n - 1)..].to_vec();
+        ctx.push(root);
+        for n in (min_n.max(1)..=max_n.min(ctx.len())).rev() {
+            let pat = &ctx[ctx.len() - n..];
+            // the root is not in the history yet, so every match here is an earlier occurrence
+            if h.len() <= n {
+                continue;
+            }
+            for s in (0..h.len() - n).rev() {
+                if &h[s..s + n] == pat {
+                    return Some(h[s + n..(s + n + len).min(h.len())].to_vec());
+                }
+            }
+        }
+        None
     }
 
     fn feed(&mut self, ids: &[i32]) -> Result<i32> {
@@ -983,6 +1009,58 @@ impl Model {
         }
         Ok((t.elapsed().as_secs_f64(), passes))
     }
+}
+
+/// Breadth-first order (parents before children; tree slot = P + index), parents renumbered.
+fn bfs(toks: &[i32], parent: &[i32], dep: &[usize]) -> (Vec<i32>, Vec<i32>) {
+    let mut order: Vec<usize> = (0..toks.len()).collect();
+    order.sort_by_key(|&i| (dep[i], i));
+    let mut new = vec![0usize; toks.len()];
+    for (j, &o) in order.iter().enumerate() {
+        new[o] = j;
+    }
+    (order.iter().map(|&o| toks[o]).collect(), order.iter().map(|&o| if parent[o] >= 0 { new[parent[o] as usize] as i32 } else { -1 }).collect())
+}
+
+/// Add a guessed word chain below the root (sharing nodes the tree already has). Each chain word scores like a guesser
+/// branch: its parent's score plus the guesser's log-probability for that word at that depth when the guesser ranked it,
+/// else `pen`. Then the lowest-scoring leaves go until the tree fits `budget` again, chain words included.
+fn merge_chain(toks: &mut Vec<i32>, parent: &mut Vec<i32>, dep: &mut Vec<usize>, score: &mut Vec<f32>, chain: &[i32], budget: usize,
+               top: &[[(f32, i32); 3]], pen: f32) {
+    let mut cur = 0usize;
+    for &w in chain.iter().take(MAXD - 2) {
+        match (0..toks.len()).find(|&c| parent[c] == cur as i32 && toks[c] == w) {
+            Some(c) => cur = c,
+            None => {
+                let d = dep[cur];
+                let lp = top.get(d).and_then(|t| t.iter().find(|x| x.1 == w)).map(|x| x.0).unwrap_or(pen);
+                toks.push(w);
+                parent.push(cur as i32);
+                dep.push(d + 1);
+                score.push(score[cur] + lp);
+                cur = toks.len() - 1;
+            }
+        }
+    }
+    let mut alive = vec![true; toks.len()];
+    let mut n = toks.len();
+    while n > budget {
+        let leaf = (1..toks.len())
+            .filter(|&i| alive[i] && !(0..toks.len()).any(|c| alive[c] && parent[c] == i as i32))
+            .min_by(|&a, &b| score[a].total_cmp(&score[b]))
+            .unwrap();
+        alive[leaf] = false;
+        n -= 1;
+    }
+    let idx: Vec<usize> = (0..toks.len()).filter(|&i| alive[i]).collect();
+    let mut new = vec![-1i32; toks.len()];
+    for (j, &i) in idx.iter().enumerate() {
+        new[i] = j as i32;
+    }
+    *parent = idx.iter().map(|&i| if parent[i] >= 0 { new[parent[i] as usize] } else { -1 }).collect();
+    *toks = idx.iter().map(|&i| toks[i]).collect();
+    *dep = idx.iter().map(|&i| dep[i]).collect();
+    *score = idx.iter().map(|&i| score[i]).collect();
 }
 
 fn main() -> Result<()> {
