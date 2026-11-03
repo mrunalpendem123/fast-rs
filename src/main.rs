@@ -28,6 +28,10 @@ const BS: usize = 128; // attention key block
 const MAXR: usize = 128; // rows per pass (prompt chunk)
 const LIN_R: usize = 4; // state rows per lane in the delta-rule kernel for chains (trees: 1, so branch states fit registers)
 
+thread_local! {
+    static PIPES: std::cell::RefCell<HashMap<String, Pipe>> = std::cell::RefCell::new(HashMap::new());
+}
+
 struct Gpu {
     dev: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -47,6 +51,11 @@ impl Gpu {
         if let Some(p) = self.pipes.get(&key) {
             return Ok(p.clone());
         }
+        // kernels compiled for an earlier model in this process are reused (the server switches models)
+        if let Some(p) = PIPES.with(|c| c.borrow().get(&key).cloned()) {
+            self.pipes.insert(key, p.clone());
+            return Ok(p);
+        }
         let mut s = String::from(kernels::HEADER);
         for (k, v) in defs {
             s += &format!("#define {k} {v}\n");
@@ -61,6 +70,7 @@ impl Gpu {
         if std::env::var("DEBUG_PIPES").is_ok() {
             eprintln!("{key}: max threads {} tg mem {}", p.maxTotalThreadsPerThreadgroup(), p.staticThreadgroupMemoryLength());
         }
+        PIPES.with(|c| c.borrow_mut().insert(key.clone(), p.clone()));
         self.pipes.insert(key, p.clone());
         Ok(p)
     }

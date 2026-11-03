@@ -13,7 +13,7 @@ use tokenizers::Tokenizer;
 
 enum Ev {
     Text(String),
-    Done,
+    Done(Value),
     Err(String),
 }
 
@@ -88,13 +88,16 @@ fn load(e: &Entry) -> Result<Loaded> {
         }
     }
     let mut m = Model::load(&e.model, e.guesser.as_deref(), 4096)?;
+    let t1 = Instant::now();
     m.autotune()?;
+    let t2 = Instant::now();
     let warm: Vec<i32> = tok.encode(render(&env, &[json!({"role": "user", "content": "Hi"})])?, false).map_err(|x| anyhow!("{x}"))?
         .get_ids().iter().map(|&x| x as i32).collect();
     m.generate(&warm, 8, &eos, budget(), &mut |_| true)?;
     m.reuse = true; // follow-up messages keep the memory of the conversation so far (exact: same words as rereading it)
     m.turn_tok = ["<|im_start|>", "<|turn>", "<start_of_turn>"].iter().find_map(|t| tok.token_to_id(t)).map(|x| x as i32);
-    eprintln!("loaded {} in {:.1}s", e.id, t0.elapsed().as_secs_f64());
+    eprintln!("loaded {} in {:.1}s (weights {:.1}s, tune {:.1}s, warm-up {:.1}s)", e.id, t0.elapsed().as_secs_f64(),
+              (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), t2.elapsed().as_secs_f64());
     Ok(Loaded { id: e.id.clone(), tok, env, eos, m })
 }
 
@@ -102,16 +105,21 @@ fn budget() -> usize {
     std::env::var("BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
 }
 
-fn engine(entries: Vec<Entry>, rx: Receiver<Job>, ready: Sender<String>) -> Result<()> {
+fn engine(entries: Vec<Entry>, rx: Receiver<Job>, ready: Sender<String>, status: Arc<Mutex<Value>>) -> Result<()> {
+    *status.lock().unwrap() = json!({"loaded": null, "loading": entries[0].id});
     let mut cur = Some(load(&entries[0])?);
+    *status.lock().unwrap() = json!({"loaded": entries[0].id, "loading": null});
     let _ = ready.send(entries[0].id.clone());
     while let Ok(job) = rx.recv() {
-        let r = (|| -> Result<()> {
+        let r = (|| -> Result<Value> {
             // switch models when the chat asks for another one: free the current one first (8 GB holds one at a time)
             if let Some(e) = entries.iter().find(|e| e.id == job.model) {
                 if cur.as_ref().map(|l| l.id != e.id).unwrap_or(true) {
                     cur = None;
-                    cur = Some(load(e)?);
+                    *status.lock().unwrap() = json!({"loaded": null, "loading": e.id});
+                    let l = load(e);
+                    *status.lock().unwrap() = json!({"loaded": l.as_ref().ok().map(|l| l.id.clone()), "loading": null});
+                    cur = Some(l?);
                 }
             }
             let l = cur.as_mut().context("no model loaded")?;
@@ -136,9 +144,9 @@ fn engine(entries: Vec<Entry>, rx: Receiver<Job>, ready: Sender<String>) -> Resu
             let dt = t0.elapsed().as_secs_f64();
             eprintln!("{} | {} prompt words | {} words in {dt:.2}s = {:.1} words/s, {:.2} words/check", l.id,
                       ids.len(), words.len(), words.len() as f64 / dt, words.len() as f64 / passes.max(1) as f64);
-            Ok(())
+            Ok(json!({"model": l.id, "words": words.len(), "seconds": dt, "checks": passes, "prompt_words": ids.len()}))
         })();
-        let _ = job.out.send(match r { Ok(()) => Ev::Done, Err(e) => Ev::Err(e.to_string()) });
+        let _ = job.out.send(match r { Ok(v) => Ev::Done(v), Err(e) => Ev::Err(e.to_string()) });
     }
     Ok(())
 }
@@ -192,8 +200,9 @@ impl Sse {
                 b.extend(b"data: [DONE]\n\n");
                 self.finished = Some(b);
             }
-            Ev::Done => {
-                let mut b = self.chunk(json!({}), json!("stop"));
+            Ev::Done(stats) => {
+                let mut b = format!("data: {}\n\n", json!({"id": self.id, "object": "chat.completion.chunk", "created": 0, "model": self.model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "fast_rs": stats})).into_bytes();
                 b.extend(b"data: [DONE]\n\n");
                 self.finished = Some(b);
             }
@@ -230,7 +239,7 @@ impl Sse {
             } else {
                 match self.rx.recv() {
                     Ok(ev) => self.take(ev),
-                    Err(_) => self.take(Ev::Done),
+                    Err(_) => self.take(Ev::Done(Value::Null)),
                 }
             }
         }
@@ -257,8 +266,10 @@ pub fn run(model: String, guesser: Option<String>, port: u16) -> Result<()> {
     let ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
     let (jtx, jrx) = channel::<Job>();
     let (rtx, rrx) = channel::<String>();
+    let status = Arc::new(Mutex::new(json!({})));
+    let st2 = status.clone();
     std::thread::spawn(move || {
-        if let Err(e) = engine(entries, jrx, rtx) {
+        if let Err(e) = engine(entries, jrx, rtx, st2) {
             eprintln!("engine failed: {e:#}");
             std::process::exit(1);
         }
@@ -270,6 +281,11 @@ pub fn run(model: String, guesser: Option<String>, port: u16) -> Result<()> {
     for mut req in server.incoming_requests() {
         let path = req.url().split('?').next().unwrap_or("").trim_end_matches('/').to_string();
         match (req.method().as_str(), path.as_str()) {
+            ("GET", "") | ("GET", "/index.html") => {
+                let h = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
+                let _ = req.respond(tiny_http::Response::from_string(include_str!("chat.html")).with_header(h));
+            }
+            ("GET", "/status") => { let v = status.lock().unwrap().clone(); json_resp(req, v, 200) }
             ("GET", "/v1/models") | ("GET", "/models") => {
                 json_resp(req, json!({"object": "list", "data": ids.iter().map(|i| json!({"id": i, "object": "model", "owned_by": "local", "created": 0})).collect::<Vec<_>>()}), 200)
             }
@@ -304,7 +320,7 @@ pub fn run(model: String, guesser: Option<String>, port: u16) -> Result<()> {
                             match ev {
                                 Ev::Text(t) => text += &t,
                                 Ev::Err(e) => err = Some(e),
-                                Ev::Done => break,
+                                Ev::Done(_) => break,
                             }
                         }
                         match err {
