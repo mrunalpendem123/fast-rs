@@ -1,0 +1,7 @@
+{"pp512":[278.35968226009936,275.35323043807614,277.8046120273082],"test":"pp512_tg128","tg128":[25.765569119453158,25.687858688037316,26.337771229884115]}
+{"category":"mt_bench","id":81,"identical_runs":3,"plain_wps":31.48309513312922,"prompt_words":34,"runs":3,"tree_wps_runs":[52.34920552465443,56.02938975765675,55.101916377539204],"words":128,"words_per_check":2.4150943396226414}
+{"category":"mt_bench","id":82,"identical_runs":3,"plain_wps":31.739642292940616,"prompt_words":58,"runs":3,"tree_wps_runs":[76.11236637786958,76.70169093138864,76.7912109899315],"words":90,"words_per_check":3.3333333333333335}
+{"category":"mt_bench","id":83,"identical_runs":3,"plain_wps":31.35308749732435,"prompt_words":69,"runs":3,"tree_wps_runs":[61.94178669752949,61.14092915482174,62.20518850201803],"words":128,"words_per_check":2.723404255319149}
+{"category":"mt_bench","id":84,"identical_runs":3,"plain_wps":31.504192918878854,"prompt_words":51,"runs":3,"tree_wps_runs":[57.14137654346609,57.548495911813966,57.444991511997614],"words":128,"words_per_check":2.5098039215686274}
+{"category":"mt_bench","id":85,"identical_runs":3,"plain_wps":31.604291554157392,"prompt_words":34,"runs":3,"tree_wps_runs":[49.14194280655298,50.75805302296697,50.34340774288667],"words":128,"words_per_check":2.206896551724138}
+{"category":"mt_bench","id":86,"identical_runs":3,"plain_wps":30.325015458229934,"prompt_words":42,"runs":3,"tree_wps_runs":[47.76199154817977,51.465905455795976,49.038532694065026],"words":128,"words_per_check":2.245614035087719}
