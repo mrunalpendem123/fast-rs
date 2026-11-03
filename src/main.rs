@@ -114,7 +114,7 @@ struct Q4<'a> {
     rows: usize,
 }
 
-/// Several matrices stacked by rows -> v7 layout.
+/// Several matrices stacked by rows -> v7 layout. Row tiles are independent, so they are split across all cores.
 fn repack(gpu: &Gpu, parts: &[Q4], k: usize) -> QW {
     let g_n = k / 64;
     let kw = k / 8;
@@ -122,35 +122,57 @@ fn repack(gpu: &Gpu, parts: &[Q4], k: usize) -> QW {
     let mut wq = vec![0u32; n / 8 * g_n * 32 * 2];
     let mut sp = vec![0u16; n / 8 * g_n * 8];
     let mut bp = vec![0u16; n / 8 * g_n * 8];
-    let mut row0 = 0;
-    for part in parts {
-        let (w, s, b) = (&part.w, &part.s, &part.b);
-        for tl in 0..part.rows / 8 {
-            let t = row0 / 8 + tl;
-            for g in 0..g_n {
-                for lane in 0..32 {
-                    let (fm, fnn) = (FM[lane], FN[lane]);
-                    for word in 0..2 {
-                        let mut v = 0u32;
-                        for half_ in 0..2 {
-                            let r = tl * 8 + fnn + half_;
-                            for i in 0..4 {
-                                let ks = word * 4 + i;
-                                let q = (w[r * kw + g * 8 + ks] >> (4 * fm)) & 0xF;
-                                v |= q << (4 * i + 16 * half_);
-                            }
+    // tile t -> (part, tile within part)
+    let mut owner = Vec::with_capacity(n / 8);
+    for (pi, part) in parts.iter().enumerate() {
+        for tl in 0..part.rows / 8 { owner.push((pi, tl)); }
+    }
+    let tile = |t: usize, wq: &mut [u32], sp: &mut [u16], bp: &mut [u16]| {
+        let (pi, tl) = owner[t];
+        let (w, s, b) = (&parts[pi].w, &parts[pi].s, &parts[pi].b);
+        for g in 0..g_n {
+            for lane in 0..32 {
+                let (fm, fnn) = (FM[lane], FN[lane]);
+                for word in 0..2 {
+                    let mut v = 0u32;
+                    for half_ in 0..2 {
+                        let r = tl * 8 + fnn + half_;
+                        for i in 0..4 {
+                            let ks = word * 4 + i;
+                            let q = (w[r * kw + g * 8 + ks] >> (4 * fm)) & 0xF;
+                            v |= q << (4 * i + 16 * half_);
                         }
-                        wq[((t * g_n + g) * 32 + lane) * 2 + word] = v;
                     }
-                }
-                for r in 0..8 {
-                    sp[(t * g_n + g) * 8 + r] = s[(tl * 8 + r) * g_n + g];
-                    bp[(t * g_n + g) * 8 + r] = b[(tl * 8 + r) * g_n + g];
+                    wq[(g * 32 + lane) * 2 + word] = v;
                 }
             }
+            for r in 0..8 {
+                sp[g * 8 + r] = s[(tl * 8 + r) * g_n + g];
+                bp[g * 8 + r] = b[(tl * 8 + r) * g_n + g];
+            }
         }
-        row0 += part.rows;
-    }
+    };
+    let tiles = n / 8;
+    let threads = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(8).min(tiles.max(1));
+    let per = tiles.div_ceil(threads);
+    std::thread::scope(|sc| {
+        let (mut wr, mut sr, mut br) = (&mut wq[..], &mut sp[..], &mut bp[..]);
+        let mut t0 = 0;
+        while t0 < tiles {
+            let cnt = per.min(tiles - t0);
+            let (w1, w2) = std::mem::take(&mut wr).split_at_mut(cnt * g_n * 64);
+            let (s1, s2) = std::mem::take(&mut sr).split_at_mut(cnt * g_n * 8);
+            let (b1, b2) = std::mem::take(&mut br).split_at_mut(cnt * g_n * 8);
+            (wr, sr, br) = (w2, s2, b2);
+            let tile = &tile;
+            sc.spawn(move || {
+                for i in 0..cnt {
+                    tile(t0 + i, &mut w1[i * g_n * 64..(i + 1) * g_n * 64], &mut s1[i * g_n * 8..(i + 1) * g_n * 8], &mut b1[i * g_n * 8..(i + 1) * g_n * 8]);
+                }
+            });
+            t0 += cnt;
+        }
+    });
     QW { wq: gpu.buf_from(&wq), sp: gpu.buf_from(&sp), bp: gpu.buf_from(&bp), n, k }
 }
 
