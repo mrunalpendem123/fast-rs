@@ -144,7 +144,8 @@ kernel void qmm(const device half* x [[buffer(0)]], const device float* xoff [[b
 
 /// Per (row, head): RMSNorm of q / k heads, RoPE (non-traditional) at the row's position, q scaled; k and v written to
 /// the memory at slot P + row. qkv row = [q (H*HD) | k (KVH*HD) | v (KVH*HD)]. One simdgroup per (row, head) over
-/// H + KVH heads. Defines: H, KVH, HD, S, EPS, THETA, SCALE.
+/// H + KVH heads. q heads sit QS apart (2*HD when each carries its output gate); RoPE turns the first ROT dims.
+/// Defines: H, KVH, HD, QS, ROT, S, EPS, THETA, SCALE.
 pub const QK_ROPE: &str = r#"
 struct Args { int n; int P; };
 kernel void qk_rope(const device float* qkv [[buffer(0)]], const device bfloat* qn [[buffer(1)]], const device bfloat* kn [[buffer(2)]],
@@ -154,8 +155,8 @@ kernel void qk_rope(const device float* qkv [[buffer(0)]], const device bfloat* 
     const int NHD = H + KVH;
     int row = int(gid) / NHD, hh = int(gid) % NHD;
     bool isq = hh < H;
-    const int W = (H + 2 * KVH) * HD;
-    const device float* src = qkv + row * W + hh * HD;
+    const int W = H * QS + 2 * KVH * HD;
+    const device float* src = qkv + row * W + (isq ? hh * QS : H * QS + (hh - H) * HD);
     const int E = HD / 32;                    // elements per lane: lane, lane+32, ...
     float v[E];
     float ss = 0.0f;
@@ -166,21 +167,23 @@ kernel void qk_rope(const device float* qkv [[buffer(0)]], const device bfloat* 
     for (int e = 0; e < E; e++) v[e] = v[e] * r * float(nw[int(lane) + 32 * e]);
     float p = float(pos[row]);
     float o[E];
-    for (int e = 0; e < E / 2; e++) {           // pair (i, i + HD/2), i = lane + 32e
+    const int ER = ROT / 32;                    // elements per lane that RoPE turns
+    for (int e = 0; e < ER / 2; e++) {          // pair (i, i + ROT/2), i = lane + 32e
         int i = int(lane) + 32 * e;
-        float inv = pow(THETA, -2.0f * float(i) / float(HD));
+        float inv = pow(THETA, -2.0f * float(i) / float(ROT));
         float ang = p * inv, c = cos(ang), s = sin(ang);
-        float x1 = v[e], x2 = v[e + E / 2];
+        float x1 = v[e], x2 = v[e + ER / 2];
         o[e] = x1 * c - x2 * s;
-        o[e + E / 2] = x2 * c + x1 * s;
+        o[e + ER / 2] = x2 * c + x1 * s;
     }
+    for (int e = ER; e < E; e++) o[e] = v[e];
     if (isq) {
         for (int e = 0; e < E; e++) qo[(row * H + hh) * HD + int(lane) + 32 * e] = o[e] * SCALE;
     } else if (row < a.n) {
         int kh = hh - H;
         int slot = a.P + row;
         for (int e = 0; e < E; e++) kc[(kh * S + slot) * HD + int(lane) + 32 * e] = half(o[e]);
-        const device float* vs = qkv + row * W + (H + KVH + kh) * HD;
+        const device float* vs = qkv + row * W + H * QS + (KVH + kh) * HD;
         for (int e = 0; e < E; e++) vc[(kh * S + slot) * HD + int(lane) + 32 * e] = half(vs[int(lane) + 32 * e]);
     }
 }
@@ -221,10 +224,11 @@ kernel void attn_split(const device float* q [[buffer(0)]], const device half* k
 "#;
 
 /// Merge the blocks in index order, write the head's output as half + group sums for the o-projection.
-/// Defines: H, D, NB.  Output row width H*D.
+/// GATE: multiply by sigmoid(gate), the second half of the head's q-projection slot. Defines: H, D, NB, GATE, QS, QW.
+/// Output row width H*D.
 pub const ATTN_MERGE: &str = r#"
 kernel void attn_merge(const device float* part [[buffer(0)]], device half* xh [[buffer(1)]],
-                       device float* xo [[buffer(2)]], device float* xs [[buffer(3)]],
+                       device float* xo [[buffer(2)]], device float* xs [[buffer(3)]], const device float* qkv [[buffer(4)]],
                        uint lane [[thread_index_in_simdgroup]], uint gid [[threadgroup_position_in_grid]]) {
     const int E = D / 32;
     int row = int(gid) / H, h = int(gid) % H;
@@ -241,7 +245,11 @@ kernel void attn_merge(const device float* part [[buffer(0)]], device half* xh [
         for (int e = 0; e < E; e++) acc[e] += part[pb + int(lane) * E + e] * c;
     }
     device half* xr = xh + row * (H * D) + h * D;
-    for (int e = 0; e < E; e++) xr[int(lane) * E + e] = half(acc[e] / l);
+    for (int e = 0; e < E; e++) {
+        float o = acc[e] / l;
+        if (GATE) { float g = qkv[row * QW + h * QS + D + int(lane) * E + e]; o = o / (1.0f + exp(-g)); }
+        xr[int(lane) * E + e] = half(o);
+    }
     simdgroup_barrier(mem_flags::mem_device);
     // this head covers D/64 groups of the o-projection input
     const int G = D / 64;
@@ -343,6 +351,140 @@ kernel void topk3(const device float* lg [[buffer(0)]], device float* tv [[buffe
         }
         tv[row * 3] = b0 - lse; tv[row * 3 + 1] = b1 - lse; tv[row * 3 + 2] = b2 - lse;
         ti[row * 3] = j0; ti[row * 3 + 1] = j1; ti[row * 3 + 2] = j2;
+    }
+}
+"#;
+
+/// Gated DeltaNet (Qwen3.5 linear layers), step 1 per (row, 128-channel block): causal depthwise conv (kernel 4) over
+/// the row's own history (earlier rows of this pass via prev[row][3] >= 0, else the committed tail: -1 newest .. -3
+/// oldest), silu, then q/k heads L2-normalised (q also scaled by 1/DK). keep: also save the row's raw and final
+/// values and its b/a inputs, so an accepted guess can be committed later. Defines: C, KD, DK, VD, HV, NLIN, KS.
+pub const LIN_CONV: &str = r#"
+struct LArgs { int keep; int n; };
+kernel void lin_conv(const device float* pre [[buffer(0)]], const device float* tail [[buffer(1)]],
+                     const device bfloat* w [[buffer(2)]], const device int* prev [[buffer(3)]],
+                     device float* post [[buffer(4)]], device float* keep [[buffer(5)]], constant LArgs& a [[buffer(6)]],
+                     uint lane [[thread_index_in_simdgroup]], uint gid [[threadgroup_position_in_grid]]) {
+    const int NB = C / 128;
+    int row = int(gid) / NB, blk = int(gid) % NB;
+    float v[4], x0[4];
+    float ss = 0.0f;
+    for (int e = 0; e < 4; e++) {
+        int c = blk * 128 + int(lane) + 32 * e;
+        x0[e] = pre[row * NLIN + c];
+        float acc = x0[e] * float(w[c * 4 + 3]);
+        for (int k = 0; k < 3; k++) {
+            int pr = prev[row * 3 + k];
+            float xp = pr >= 0 ? pre[pr * NLIN + c] : tail[(3 + pr) * C + c];
+            acc += xp * float(w[c * 4 + 2 - k]);
+        }
+        v[e] = acc / (1.0f + exp(-acc));
+        ss += v[e] * v[e];
+    }
+    if (blk < 2 * KD / 128) {
+        ss = simd_sum(ss);
+        float r = rsqrt(ss / float(DK) + 1e-6f / float(DK));
+        float sc = blk < KD / 128 ? 1.0f / float(DK) : rsqrt(float(DK));
+        for (int e = 0; e < 4; e++) v[e] = v[e] * r * sc;
+    }
+    for (int e = 0; e < 4; e++) {
+        int c = blk * 128 + int(lane) + 32 * e;
+        post[row * C + c] = v[e];
+        if (a.keep && row < a.n) { keep[row * KS + c] = x0[e]; keep[row * KS + C + c] = v[e]; }
+    }
+    if (a.keep && row < a.n && blk == 0)
+        for (int i = int(lane); i < 2 * HV; i += 32) keep[row * KS + 2 * C + i] = pre[row * NLIN + C + VD + i];
+}
+"#;
+
+/// Committed conv tail (last 3 raw rows) <- old tail followed by rows ridx[0..n] of src. Defines: C.
+pub const LIN_TAIL: &str = r#"
+struct TArgs { int n; int stride; };
+kernel void lin_tail(const device float* src [[buffer(0)]], const device int* ridx [[buffer(1)]], device float* tail [[buffer(2)]],
+                     constant TArgs& a [[buffer(3)]], uint c [[thread_position_in_grid]]) {
+    if (int(c) >= C) return;
+    float t0 = tail[c], t1 = tail[C + c], t2 = tail[2 * C + c];
+    for (int i = 0; i < a.n; i++) { t0 = t1; t1 = t2; t2 = src[ridx[i] * a.stride + c]; }
+    tail[c] = t0; tail[C + c] = t1; tail[2 * C + c] = t2;
+}
+"#;
+
+/// Delta rule, one simdgroup per (value head, value row of the state); each lane owns 4 key columns. Rows are taken in
+/// order j = 0..n (row ridx[j]); row j starts from the state after row par[j] (-1: the committed state), so a tree's
+/// branches each get their own state (parents come first) and a chain is the same arithmetic. write: store the last
+/// row's state as the new committed state. One kernel for prompt chunks, single words, trees and commits: a word's
+/// numbers never depend on which. Defines: HV, HK, DK, DV, KD.
+pub const LIN_DELTA: &str = r#"
+struct DArgs { int n; int write; int pstride; int poff; int abstride; int boff; };
+kernel void lin_delta(const device float* post [[buffer(0)]], const device float* ab [[buffer(1)]],
+                      const device float* alog [[buffer(2)]], const device bfloat* dtb [[buffer(3)]],
+                      device float* state [[buffer(4)]], const device int* par [[buffer(5)]], const device int* ridx [[buffer(6)]],
+                      device float* y [[buffer(7)]], constant DArgs& a [[buffer(8)]],
+                      uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                      uint2 tg [[threadgroup_position_in_grid]]) {
+    int hv = int(tg.x), dv = int(tg.y) * 4 + int(sg), hk = hv / (HV / HK);
+    device float* sp = state + (hv * DV + dv) * DK + int(lane) * 4;
+    float s0[4], cur[4], st[16][4];
+    for (int i = 0; i < 4; i++) { s0[i] = sp[i]; cur[i] = s0[i]; }
+    float A = exp(alog[hv]), bias = float(dtb[hv]);
+    for (int j = 0; j < a.n; j++) {
+        int r = ridx[j], pj = par[j];
+        float s[4];
+        for (int i = 0; i < 4; i++) s[i] = pj < 0 ? s0[i] : (pj == j - 1 ? cur[i] : st[pj][i]);
+        const device float* pr = post + r * a.pstride + a.poff;
+        const device float* q = pr + hk * DK + int(lane) * 4;
+        const device float* k = pr + KD + hk * DK + int(lane) * 4;
+        float v = pr[2 * KD + hv * DV + dv];
+        float bb = ab[r * a.abstride + a.boff + hv], aa = ab[r * a.abstride + a.boff + HV + hv] + bias;
+        float soft = aa > 20.0f ? aa : log(1.0f + exp(aa));
+        float g = exp(-A * soft), beta = 1.0f / (1.0f + exp(-bb));
+        float kv = 0.0f;
+        for (int i = 0; i < 4; i++) { s[i] = s[i] * g; kv += s[i] * k[i]; }
+        kv = simd_sum(kv);
+        float delta = (v - kv) * beta;
+        float o = 0.0f;
+        for (int i = 0; i < 4; i++) { s[i] = s[i] + k[i] * delta; o += s[i] * q[i]; }
+        o = simd_sum(o);
+        if (lane == 0) y[r * (HV * DV) + hv * DV + dv] = o;
+        for (int i = 0; i < 4; i++) cur[i] = s[i];
+        if (j < 16) for (int i = 0; i < 4; i++) st[j][i] = s[i];
+    }
+    if (a.write && a.n > 0) for (int i = 0; i < 4; i++) sp[i] = cur[i];
+}
+"#;
+
+/// Per (row, value head): RMSNorm(y) * w * silu(z) -> half + group sums for the out-projection. Defines: HV, DV, C, NLIN, EPS.
+pub const LIN_NORM: &str = r#"
+kernel void lin_norm(const device float* y [[buffer(0)]], const device float* zb [[buffer(1)]], const device bfloat* w [[buffer(2)]],
+                     device half* xh [[buffer(3)]], device float* xo [[buffer(4)]], device float* xs [[buffer(5)]],
+                     uint lane [[thread_index_in_simdgroup]], uint gid [[threadgroup_position_in_grid]]) {
+    int row = int(gid) / HV, hv = int(gid) % HV;
+    const device float* yr = y + row * (HV * DV) + hv * DV;
+    float v[DV / 32];
+    float ss = 0.0f;
+    for (int e = 0; e < DV / 32; e++) { v[e] = yr[int(lane) + 32 * e]; ss += v[e] * v[e]; }
+    ss = simd_sum(ss);
+    float r = rsqrt(ss / float(DV) + EPS);
+    device half* xr = xh + row * (HV * DV) + hv * DV;
+    for (int e = 0; e < DV / 32; e++) {
+        int d = int(lane) + 32 * e;
+        float z = zb[row * NLIN + C + hv * DV + d];
+        xr[d] = half(v[e] * r * float(w[d]) * (z / (1.0f + exp(-z))));
+    }
+    simdgroup_barrier(mem_flags::mem_device);
+    const int G = DV / 64;
+    if (int(lane) < G) {
+        int g = int(lane);
+        const device half* gr = xr + g * 64;
+        float s_ = 0.0f, o = 0.0f;
+        for (int ks = 0; ks < 8; ks++) {
+            float t = 0.0f;
+            for (int j = 0; j < 8; j++) t += float(gr[ks * 8 + j]);
+            s_ += t;
+            o += t * ((ks & 1) ? 64.0f : 1024.0f);
+        }
+        xs[row * (HV * G) + hv * G + g] = s_;
+        xo[row * (HV * G) + hv * G + g] = o;
     }
 }
 "#;
