@@ -351,12 +351,14 @@ body.app .ins { padding-top: 44px; }
 <script>
 /* ======================= data ======================= */
 const MODELS = {
-  "qwen3-4b": {name: "Qwen3-4B", info: "Best all-rounder · fastest on code and maths", load: 20, think: true},
-  "qwen3.5-4b": {name: "Qwen3.5-4B", info: "Newer Qwen · linear-attention layers", load: 25, think: true},
-  "gemma-4-e2b": {name: "Gemma 4 E2B", info: "Smallest and quickest to load · 1.6 GB", load: 8, think: false},
-  "gemma-4-e4b": {name: "Gemma 4 E4B", info: "Larger Gemma · 3.1 GB", load: 30, think: false}
+  "qwen3-4b": {name: "Qwen3-4B", info: "Best all-rounder · fastest on code and maths · 12k-word memory", load: 20, think: true, ctx: 12288},
+  "qwen3.5-4b": {name: "Qwen3.5-4B", info: "Newer Qwen · 24k-word memory", load: 30, think: true, ctx: 24576},
+  "gemma-4-e2b": {name: "Gemma 4 E2B", info: "Smallest and quickest to load · 32k-word memory", load: 8, think: false, ctx: 32768},
+  "gemma-4-e4b": {name: "Gemma 4 E4B", info: "Larger Gemma · 16k-word memory", load: 30, think: false, ctx: 16384}
 };
-const GPU_LIMIT = 5.73, FILE_BUDGET = 22000; // characters of attached text per message (~6k words)
+const GPU_LIMIT = 5.73;
+// attached text may use about 40% of the model's chat memory (~3.5 characters per word), leaving room to answer
+const fileBudget = () => Math.round((MODELS[model]?.ctx || 8192) * 0.4 * 3.5);
 const $ = id => document.getElementById(id);
 const store = {
   get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
@@ -416,13 +418,14 @@ function md(src) {
   flush(); close();
   return out;
 }
-/* split an answer into its reasoning (<think>…</think>) and the reply */
-function split(raw) {
-  const s = raw.replace(/^\s+/, "");
-  if (!s.startsWith("<think>")) return {think: null, open: false, text: raw};
-  const e = s.indexOf("</think>");
-  if (e < 0) return {think: s.slice(7), open: true, text: ""};
-  return {think: s.slice(7, e), open: false, text: s.slice(e + 8).replace(/^\s+/, "")};
+/* split an answer into its reasoning and the reply. Qwen3 opens with <think>; Qwen3.5's prompt already holds the
+   opening tag, so its reasoning starts bare and only the closing </think> arrives. */
+function split(raw, thinking) {
+  const s = raw.replace(/^\s+/, ""), open = s.startsWith("<think>"), body = open ? s.slice(7) : s;
+  const e = body.indexOf("</think>");
+  if (e >= 0 && (open || thinking)) return {think: body.slice(0, e), open: false, text: body.slice(e + 8).replace(/^\s+/, "")};
+  if (open || thinking) return {think: body, open: true, text: ""};
+  return {think: null, open: false, text: raw};
 }
 
 /* ======================= rail ======================= */
@@ -490,14 +493,14 @@ function footHTML(m, i) {
   return `<div class="foot"><span><b data-count="${wps.toFixed(1)}">${wps.toFixed(1)}</b> words/s</span><span>${s.words} words · ${s.seconds.toFixed(1)} s</span><span>${per.toFixed(2)} words / check</span>` +
     `<span class="exact"><svg width="11" height="11" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 7.5 5.5 11 12 3.5" fill="none" stroke="currentColor" stroke-width="2"/></svg>exact</span>` +
     (m.stopped ? '<span class="stopped">Stopped</span>' : "") +
-    (s.finish === "length" ? '<button class="act cont" type="button" data-continue>Memory full · continue →</button>' : "") + tail;
+    (s.finish === "length" ? `<button class="act cont" type="button" data-continue>Chat memory full (${(s.prompt_words + s.words).toLocaleString()} words) · continue in a new turn →</button>` : "") + tail;
 }
 function thinkHTML(t, secs, live) {
   return `<details class="think${live ? " live" : ""}"${live ? " open" : ""}><summary><span class="label">${live ? "Thinking" : `Thought for ${secs ? secs.toFixed(1) + " s" : "a moment"}`}</span><svg class="chev" width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 3.5 5 6.5 8 3.5" fill="none" stroke="currentColor" stroke-width="1.4"/></svg></summary><div class="tt">${esc(t.trim())}</div></details>`;
 }
 function botEl(m, i) {
   const d = document.createElement("div"); d.className = "msg bot";
-  const p = split(m.content);
+  const p = split(m.content, m.thinking);
   d.innerHTML = whoHTML(m, m.error ? "error" : "done", "done") + (p.think != null && p.think.trim() ? thinkHTML(p.think, m.thinkSecs, false) : "") +
     `<div class="body">${md(p.text)}</div>` + (m.error ? `<div class="err">${esc(m.error)}</div>` : "") + footHTML(m, i);
   return d;
@@ -629,7 +632,7 @@ async function readPdf(file) {
     pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
   }
   const pdf = await pdfjsLib.getDocument({data: await file.arrayBuffer()}).promise; let out = "";
-  for (let p = 1; p <= pdf.numPages && out.length < FILE_BUDGET * 2; p++) { const tc = await (await pdf.getPage(p)).getTextContent(); out += tc.items.map(i => i.str).join(" ") + "\n\n"; }
+  for (let p = 1; p <= pdf.numPages && out.length < fileBudget() * 2; p++) { const tc = await (await pdf.getPage(p)).getTextContent(); out += tc.items.map(i => i.str).join(" ") + "\n\n"; }
   return out;
 }
 async function addFiles(list) {
@@ -683,7 +686,7 @@ async function send(opts = {}) {
   let text = input.value.trim();
   if (!opts.regen) {
     if (!text && !pending.length) return;
-    let budget = FILE_BUDGET;
+    let budget = fileBudget();
     const files = pending.filter(f => !f.busy).map(f => { const t = f.text.slice(0, Math.max(0, budget)); budget -= t.length; return {name: f.name, size: f.size, words: f.words, text: t, trimmed: t.length < f.text.length}; });
     if (files.some(f => f.trimmed)) toast("Long files were trimmed to fit the model's memory");
     if (!text && files.length) text = "Summarize this.";
@@ -692,7 +695,8 @@ async function send(opts = {}) {
     cur.messages.push({role: "user", content: text, files});
   }
   cur.model = model; saveChats(); renderThread(); renderRail();
-  const msg = {role: "assistant", content: "", model}, loading = status.loaded !== model;
+  const thinking = !!(MODELS[model]?.think && settings.think);
+  const msg = {role: "assistant", content: "", model, thinking}, loading = status.loaded !== model;
   const el = document.createElement("div"); el.className = "msg bot";
   el.innerHTML = whoHTML(msg, loading ? "loading" : "thinking", "live") + stageHTML(loading) + '<div class="tk"></div><div class="body"><div class="hd"></div><div class="tl"></div></div>';
   $("thread").appendChild(el);
@@ -705,10 +709,10 @@ async function send(opts = {}) {
   let painting = false;
   const msgs = [];
   if (settings.system.trim()) msgs.push({role: "system", content: settings.system.trim()});
-  cur.messages.forEach(m => msgs.push({role: m.role, content: m.role === "user" ? withFiles(m) : split(m.content).text}));
+  cur.messages.forEach(m => msgs.push({role: m.role, content: m.role === "user" ? withFiles(m) : split(m.content, m.thinking).text}));
   try {
     const r = await fetch("/v1/chat/completions", {method: "POST", signal: gen.ctrl.signal, headers: {"content-type": "application/json"},
-      body: JSON.stringify({model, stream: true, think: !!(MODELS[model]?.think && settings.think), messages: msgs})});
+      body: JSON.stringify({model, stream: true, think: thinking, messages: msgs})});
     if (!r.ok) throw new Error(`The engine answered ${r.status}`);
     const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "", end = false; gen.reader = rd;
     while (!end) {
@@ -734,7 +738,7 @@ async function send(opts = {}) {
   clearInterval(timer);
   const g = gen; gen = null;
   if (g.stopped) msg.stopped = true;
-  if (split(msg.content).think != null) msg.thinkSecs = ((g.thinkEnd || performance.now()) - (g.thinkStart || g.first || g.t0)) / 1000;
+  if (split(msg.content, msg.thinking).think != null) msg.thinkSecs = ((g.thinkEnd || performance.now()) - (g.thinkStart || g.first || g.t0)) / 1000;
   const err = msg.content.match(/\n?\[engine error: ([^\]]+)\]/); if (err) { msg.error = err[1]; msg.content = msg.content.replace(err[0], "").trim(); }
   if (msg.content || msg.error) cur.messages.push(msg);
   saveChats();
@@ -758,7 +762,7 @@ function tickStage() {
 }
 function render() {
   if (!gen) return;
-  const {el, msg} = gen, p = split(msg.content), who = el.querySelector(".who .st");
+  const {el, msg} = gen, p = split(msg.content, msg.thinking), who = el.querySelector(".who .st");
   const st = el.querySelector(".stage");
   if (st && !st.classList.contains("out")) { st.classList.add("out"); setTimeout(() => st.remove(), 320); }
   if (p.think != null) {

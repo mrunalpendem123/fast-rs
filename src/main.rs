@@ -778,7 +778,8 @@ impl Model {
             }
         }
         let ats: Vec<At> = self.t.layers.iter().filter(|l| l.lin.is_none()).map(|l| l.at.clone()).collect();
-        for nb in 1..=(self.maxlen + MAXD).div_ceil(BS) {
+        // short conversations are ready at once; longer ones compile their attention variant on first use
+        for nb in 1..=(self.maxlen + MAXD).div_ceil(BS).min(2048 / BS + 1) {
             for a in &ats {
                 self.gpu.pipe("attn_split", kernels::ATTN_SPLIT, &split_defs(a, self.maxlen, nb))?;
                 self.gpu.pipe("attn_merge", kernels::ATTN_MERGE, &merge_defs(a, nb))?;

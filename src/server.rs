@@ -50,23 +50,27 @@ pub(crate) fn render_with(env: &Environment, messages: &[Value], think: bool) ->
     Ok(env.get_template("chat")?.render(context! {messages => msgs, add_generation_prompt => true, enable_thinking => think})?)
 }
 
-/// Models this Mac can serve: (id shown in the chat app, model dir, guesser dir). Only pairs that fit 8 GB and
-/// were checked exact are listed; `fast-rs serve MODELS_DIR` keeps the ones present on disk.
-const CATALOG: &[(&str, &str, &str)] = &[
-    ("qwen3-4b", "qwen3-4b-4bit", "qwen3-4b-dflash"),
-    ("qwen3.5-4b", "qwen3.5-4b-4bit", "qwen3.5-4b-dflash"),
-    ("gemma-4-e2b", "gemma-4-e2b-mlx", "gemma-4-e2b-assistant"),
-    ("gemma-4-e4b", "gemma-4-e4b-mlx", "gemma-4-e4b-assistant"),
+/// Models this Mac can serve: (id shown in the chat app, model dir, guesser dir, words of chat memory). Only pairs that
+/// fit 8 GB and were checked exact are listed; `fast-rs serve MODELS_DIR` keeps the ones present on disk. Chat memory is
+/// sized per model so the whole setup stays near 4.5-5 GB of GPU memory: Qwen3-4B keeps a key/value list in every layer,
+/// Qwen3.5 only in 8 of 32 layers and Gemma 4 shares most of its lists, so they can hold far longer chats.
+const CATALOG: &[(&str, &str, &str, usize)] = &[
+    ("qwen3-4b", "qwen3-4b-4bit", "qwen3-4b-dflash", 12288),
+    ("qwen3.5-4b", "qwen3.5-4b-4bit", "qwen3.5-4b-dflash", 24576),
+    ("gemma-4-e2b", "gemma-4-e2b-mlx", "gemma-4-e2b-assistant", 32768),
+    ("gemma-4-e4b", "gemma-4-e4b-mlx", "gemma-4-e4b-assistant", 16384),
 ];
 
 pub(crate) struct Entry {
     pub id: String,
+    ctx: usize,
     model: PathBuf,
     guesser: Option<PathBuf>,
 }
 
 struct Loaded {
     id: String,
+    ctx: usize,
     tok: Tokenizer,
     env: Environment<'static>,
     eos: Vec<i32>,
@@ -93,7 +97,8 @@ fn load(e: &Entry) -> Result<Loaded> {
             eos.push(id as i32);
         }
     }
-    let mut m = Model::load(&e.model, e.guesser.as_deref(), ctx())?;
+    let ctx = ctx_for(e);
+    let mut m = Model::load(&e.model, e.guesser.as_deref(), ctx)?;
     let t1 = Instant::now();
     m.autotune()?;
     let t2 = Instant::now();
@@ -103,14 +108,14 @@ fn load(e: &Entry) -> Result<Loaded> {
     m.reuse = true; // follow-up messages keep the memory of the conversation so far (exact: same words as rereading it)
     m.turn_tok = ["<|im_start|>", "<|turn>", "<start_of_turn>"].iter().find_map(|t| tok.token_to_id(t)).map(|x| x as i32);
     eprintln!("loaded {} in {:.1}s (weights {:.1}s, tune {:.1}s, warm-up {:.1}s), {} words of context, GPU memory {:.2} GB", e.id,
-              t0.elapsed().as_secs_f64(), (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), t2.elapsed().as_secs_f64(), ctx(),
+              t0.elapsed().as_secs_f64(), (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), t2.elapsed().as_secs_f64(), ctx,
               m.gpu_bytes() as f64 / 1e9);
-    Ok(Loaded { id: e.id.clone(), tok, env, eos, m })
+    Ok(Loaded { id: e.id.clone(), ctx, tok, env, eos, m })
 }
 
 /// Words of conversation the engine keeps in memory (question + history + answer). FAST_CTX overrides.
-fn ctx() -> usize {
-    std::env::var("FAST_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(8192)
+fn ctx_for(e: &Entry) -> usize {
+    std::env::var("FAST_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(e.ctx)
 }
 
 fn budget() -> usize {
@@ -120,7 +125,8 @@ fn budget() -> usize {
 fn engine(entries: Vec<Entry>, rx: Receiver<Job>, ready: Sender<String>, status: Arc<Mutex<Value>>) -> Result<()> {
     *status.lock().unwrap() = json!({"loaded": null, "loading": entries[0].id});
     let mut cur = Some(load(&entries[0])?);
-    *status.lock().unwrap() = json!({"loaded": entries[0].id, "loading": null, "gpu_gb": cur.as_ref().map(|l| l.m.gpu_bytes() as f64 / 1e9)});
+    *status.lock().unwrap() = json!({"loaded": entries[0].id, "loading": null, "gpu_gb": cur.as_ref().map(|l| l.m.gpu_bytes() as f64 / 1e9),
+                                     "context": cur.as_ref().map(|l| l.ctx)});
     let _ = ready.send(entries[0].id.clone());
     while let Ok(job) = rx.recv() {
         let r = (|| -> Result<Value> {
@@ -131,7 +137,7 @@ fn engine(entries: Vec<Entry>, rx: Receiver<Job>, ready: Sender<String>, status:
                     *status.lock().unwrap() = json!({"loaded": null, "loading": e.id});
                     let l = load(e);
                     *status.lock().unwrap() = json!({"loaded": l.as_ref().ok().map(|l| l.id.clone()), "loading": null,
-                        "gpu_gb": l.as_ref().ok().map(|l| l.m.gpu_bytes() as f64 / 1e9)});
+                        "gpu_gb": l.as_ref().ok().map(|l| l.m.gpu_bytes() as f64 / 1e9), "context": l.as_ref().ok().map(|l| l.ctx)});
                     cur = Some(l?);
                 }
             }
@@ -142,11 +148,11 @@ fn engine(entries: Vec<Entry>, rx: Receiver<Job>, ready: Sender<String>, status:
                 let text = render_with(&l.env, &msgs, job.think)?;
                 let ids: Vec<i32> = l.tok.encode(text, false).map_err(|e| anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
                 let first = msgs.iter().position(|m| m["role"] != "system").unwrap_or(0);
-                if ids.len() + 1024 <= ctx() || msgs.len() - first <= 1 { break ids; }
+                if ids.len() + 1024 <= l.ctx || msgs.len() - first <= 1 { break ids; }
                 msgs.remove(first);
             };
-            anyhow::ensure!(ids.len() + 64 < ctx(), "the message is too long for this model's memory ({} words)", ids.len());
-            let max = job.max.min(ctx() - ids.len() - 32);
+            anyhow::ensure!(ids.len() + 64 < l.ctx, "the message is too long for this model's memory ({} words)", ids.len());
+            let max = job.max.min(l.ctx - ids.len() - 32);
             let mut words: Vec<u32> = Vec::new();
             let mut sent = String::new();
             let t0 = Instant::now();
@@ -276,11 +282,11 @@ fn json_resp(req: tiny_http::Request, v: Value, code: u16) {
 pub fn run(model: String, guesser: Option<String>, port: u16) -> Result<()> {
     let p = PathBuf::from(&model);
     let entries: Vec<Entry> = if p.join("config.json").exists() {
-        vec![Entry { id: p.file_name().unwrap().to_string_lossy().to_string(), model: p, guesser: guesser.map(PathBuf::from) }]
+        vec![Entry { id: p.file_name().unwrap().to_string_lossy().to_string(), ctx: 8192, model: p, guesser: guesser.map(PathBuf::from) }]
     } else {
         // a folder of models: serve every catalog pair found there, the first one loaded at start
-        let mut v: Vec<Entry> = CATALOG.iter().filter(|(_, m, _)| p.join(m).join("config.json").exists())
-            .map(|(id, m, g)| Entry { id: id.to_string(), model: p.join(m), guesser: Some(p.join(g)).filter(|g| g.exists()) }).collect();
+        let mut v: Vec<Entry> = CATALOG.iter().filter(|(_, m, _, _)| p.join(m).join("config.json").exists())
+            .map(|(id, m, g, c)| Entry { id: id.to_string(), ctx: *c, model: p.join(m), guesser: Some(p.join(g)).filter(|g| g.exists()) }).collect();
         if let Some(first) = guesser.as_deref().and_then(|f| v.iter().position(|e| e.id == f)) { v.swap(0, first); }
         v
     };
@@ -307,7 +313,7 @@ pub fn run(model: String, guesser: Option<String>, port: u16) -> Result<()> {
                 let h = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
                 let _ = req.respond(tiny_http::Response::from_string(include_str!("chat.html")).with_header(h));
             }
-            ("GET", "/status") => { let mut v = status.lock().unwrap().clone(); v["context"] = json!(ctx()); json_resp(req, v, 200) }
+            ("GET", "/status") => { let v = status.lock().unwrap().clone(); json_resp(req, v, 200) }
             ("GET", "/v1/models") | ("GET", "/models") => {
                 json_resp(req, json!({"object": "list", "data": ids.iter().map(|i| json!({"id": i, "object": "model", "owned_by": "local", "created": 0})).collect::<Vec<_>>()}), 200)
             }
