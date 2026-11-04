@@ -543,6 +543,8 @@ struct Model {
     hist: Vec<i32>,
     pub draft_s: f64,
     commit_s: f64,
+    gpu_draft: f64, // GPU-clock busy time per generate(): draft and verify command buffers
+    gpu_verify: f64,
     tune: HashMap<String, (usize, usize)>,
     want_depth: usize,   // deepest tree level the next guess needs (budget - 1)
     pub reuse: bool,     // keep the memory of words a new prompt shares with the previous conversation
@@ -665,6 +667,8 @@ impl Model {
             hist: Vec::new(),
             draft_s: 0.0,
             commit_s: 0.0,
+            gpu_draft: 0.0,
+            gpu_verify: 0.0,
             tune: HashMap::new(),
             want_depth: 15,
             reuse: false,
@@ -1090,6 +1094,7 @@ impl Model {
             e.endEncoding();
             cb.commit();
             cb.waitUntilCompleted();
+            self.gpu_verify += cb.GPUEndTime() - cb.GPUStartTime();
             if self.asst.is_some() {
                 self.hrows = read(&self.h, n_real * d);
             }
@@ -1209,6 +1214,7 @@ impl Model {
         e.endEncoding();
         cb.commit();
         cb.waitUntilCompleted();
+        self.gpu_draft += cb.GPUEndTime() - cb.GPUStartTime();
         let v: Vec<f32> = read(&self.tv, hr * 3);
         let t: Vec<i32> = read(&self.ti, hr * 3);
         Ok((0..hr).map(|r| [(v[r * 3], t[r * 3]), (v[r * 3 + 1], t[r * 3 + 1]), (v[r * 3 + 2], t[r * 3 + 2])]).collect())
@@ -1404,6 +1410,8 @@ impl Model {
         self.kept = keep;
         self.draft_s = 0.0;
         self.commit_s = 0.0;
+        self.gpu_draft = 0.0;
+        self.gpu_verify = 0.0;
         // hybrid + reuse: read the prompt up to just after its last "<|im_start|>assistant\n", snapshot, read the rest
         let cut = match (hybrid && self.reuse, self.turn_tok) {
             (true, Some(tt)) => prompt.iter().rposition(|&x| x == tt).map(|i| i + 3).filter(|&b| b > keep && b < prompt.len()),
@@ -1601,9 +1609,10 @@ fn main() -> Result<()> {
                     eprintln!("  assistant per pass: {:.1} rounds, GPU {:.1} ms, CPU head {:.1} ms", m.prof[2] / passes as f64,
                               m.prof[0] / passes as f64 * 1e3, m.prof[1] / passes as f64 * 1e3);
                 }
-                line += &format!(" | tree{b}: {:5.1} w/s {:.2} w/chk (guess {:.1} + check {:.1} ms, commit {:.1}) {}", tree.len() as f64 / tt,
-                    tree.len() as f64 / passes as f64, m.draft_s / passes as f64 * 1e3, (tt - m.draft_s) / passes as f64 * 1e3,
-                    m.commit_s / passes as f64 * 1e3,
+                let pp = passes as f64 / 1e3;
+                line += &format!(" | tree{b}: {:5.1} w/s {:.2} w/chk (guess {:.1} + check {:.1} ms, commit {:.1}; GPU busy {:.1}+{:.1} of {:.1} ms) {}", tree.len() as f64 / tt,
+                    tree.len() as f64 / passes as f64, m.draft_s / pp, (tt - m.draft_s) / pp,
+                    m.commit_s / pp, m.gpu_draft / pp, m.gpu_verify / pp, tt / pp,
                     if tree == plain { "OK" } else { "DIFF" });
             }
         }
