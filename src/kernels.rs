@@ -714,3 +714,49 @@ kernel void sconv(const device float* bcx [[buffer(0)]], const device bfloat* ca
     y[long(r) * D + c] = bcx[long(rr) * 3 * D + D + c] * acc;
 }
 "#;
+
+/// Candidate tokens for a DSpark Markov chain: every logit of the row that is among its NEED best (plus ties in the
+/// same narrow bucket), unsorted, at most CAP. Row max, then a histogram of (max - x) in 1/16-logit buckets over 32
+/// logits, the bucket holding the NEED-th best, then a gather. One 1024-thread group per row. Defines: V, NEED, CAP.
+pub const TOPKC: &str = r#"
+kernel void topkc(const device float* lg [[buffer(0)]], device float* cv [[buffer(1)]], device int* ci [[buffer(2)]],
+                  device int* cn [[buffer(3)]], uint row [[threadgroup_position_in_grid]],
+                  uint tid [[thread_position_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                  uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float smax[32];
+    threadgroup atomic_uint hist[512];
+    threadgroup uint cut;
+    threadgroup atomic_uint cnt;
+    const device float* r = lg + long(row) * V;
+    float m = -INFINITY;
+    for (int i = int(tid); i < V; i += 1024) m = max(m, r[i]);
+    m = simd_max(m);
+    if (lane == 0) smax[sg] = m;
+    if (tid < 512) atomic_store_explicit(&hist[tid], 0u, memory_order_relaxed);
+    if (tid == 0) atomic_store_explicit(&cnt, 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float M = smax[0];
+    for (int i = 1; i < 32; i++) M = max(M, smax[i]);
+    for (int i = int(tid); i < V; i += 1024) {
+        float d = (M - r[i]) * 16.0f;
+        if (d < 512.0f) atomic_fetch_add_explicit(&hist[int(d)], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint s = 0, b = 511;
+        for (uint i = 0; i < 512; i++) { s += atomic_load_explicit(&hist[i], memory_order_relaxed); if (s >= NEED) { b = i; break; } }
+        cut = b;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float lim = float(cut + 1) / 16.0f;
+    for (int i = int(tid); i < V; i += 1024) {
+        float x = r[i];
+        if ((M - x) < lim) {
+            uint j = atomic_fetch_add_explicit(&cnt, 1u, memory_order_relaxed);
+            if (j < CAP) { cv[row * CAP + j] = x; ci[row * CAP + j] = i; }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) cn[row] = int(min(atomic_load_explicit(&cnt, memory_order_relaxed), uint(CAP)));
+}
+"#;

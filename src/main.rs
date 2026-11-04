@@ -26,7 +26,8 @@ type Enc = ProtocolObject<dyn MTLComputeCommandEncoder>;
 const MAXD: usize = 16; // deepest tree path / guesser block
 const BS: usize = 128; // attention key block
 const MAXR: usize = 128; // rows per pass (prompt chunk)
-const LIN_R: usize = 4; // state rows per lane in the delta-rule kernel for chains (trees: 1, so branch states fit registers)
+const LIN_R: usize = 4;
+const DCAP: usize = 256; // DSpark: candidate tokens kept per drafted position (the 64 best and their bucket's ties) // state rows per lane in the delta-rule kernel for chains (trees: 1, so branch states fit registers)
 
 thread_local! {
     /// seconds spent compiling source, building pipelines, and how many kernels were built (for load-time reports)
@@ -711,6 +712,10 @@ struct Model {
     pick: Buf,
     tv: Buf,
     ti: Buf,
+    cv: Buf,                      // DSpark: per draft row, candidate logits / token ids / count (TOPKC)
+    ci: Buf,
+    cn: Buf,
+    dcand: Vec<Vec<(f32, i32)>>,  // the last draft's candidates per position (DSpark Markov chain)
     p: usize,
     hist: Vec<i32>,
     pub draft_s: f64,
@@ -852,6 +857,10 @@ impl Model {
             pick: gpu.buf(16 * 4),
             tv: gpu.buf(16 * 3 * 4),
             ti: gpu.buf(16 * 3 * 4),
+            cv: gpu.buf(16 * DCAP * 4),
+            ci: gpu.buf(16 * DCAP * 4),
+            cn: gpu.buf(16 * 4),
+            dcand: Vec::new(),
             t,
             g,
             maxlen,
@@ -1448,15 +1457,37 @@ impl Model {
         let hn = hr.div_ceil(8) * 8;
         let (nt, sk) = self.cfg_for(head.n, head.k, hn / 8);
         self.enc_qmm_at(&e, head, [&xh, &xo, &xs], first, &logits, hn, false, nt, sk)?;
-        let p_top = self.gpu.pipe("topk3", kernels::TOPK3, &[("V", gc.vocab.to_string())])?;
-        e.setComputePipelineState(&p_top);
-        let (tv, ti) = (self.tv.clone(), self.ti.clone());
-        bind(&e, &[&logits, &tv, &ti]);
-        e.dispatchThreadgroups_threadsPerThreadgroup(sz(hr), sz(256));
+        let markov = g.markov.is_some();
+        if markov {
+            let p_c = self.gpu.pipe("topkc", kernels::TOPKC, &[("V", gc.vocab.to_string()), ("NEED", "64".into()), ("CAP", DCAP.to_string())])?;
+            e.setComputePipelineState(&p_c);
+            bind(&e, &[&logits, &self.cv, &self.ci, &self.cn]);
+            e.dispatchThreadgroups_threadsPerThreadgroup(sz(hr), sz(1024));
+        } else {
+            let p_top = self.gpu.pipe("topk3", kernels::TOPK3, &[("V", gc.vocab.to_string())])?;
+            e.setComputePipelineState(&p_top);
+            let (tv, ti) = (self.tv.clone(), self.ti.clone());
+            bind(&e, &[&logits, &tv, &ti]);
+            e.dispatchThreadgroups_threadsPerThreadgroup(sz(hr), sz(256));
+        }
         e.endEncoding();
         cb.commit();
         cb.waitUntilCompleted();
         self.gpu_draft += cb.GPUEndTime() - cb.GPUStartTime();
+        if markov {
+            let (cnt, v, t): (Vec<i32>, Vec<f32>, Vec<i32>) = (read(&self.cn, hr), read(&self.cv, hr * DCAP), read(&self.ci, hr * DCAP));
+            self.dcand = (0..hr).map(|r| (0..cnt[r] as usize).map(|j| (v[r * DCAP + j], t[r * DCAP + j])).collect()).collect();
+            // a top-3 view, only needed by the tree builder (DSPARK_TREE); the chain reads dcand directly
+            if std::env::var("DSPARK_TREE").is_err() {
+                return Ok(vec![[(0.0, 0); 3]; hr]);
+            }
+            return Ok(self.dcand.iter().map(|c| {
+                let mut c = c.clone();
+                c.sort_by(|a, b| b.0.total_cmp(&a.0));
+                let at = |i: usize| c.get(i).copied().unwrap_or((f32::MIN, 0));
+                [at(0), at(1), at(2)]
+            }).collect());
+        }
         let v: Vec<f32> = read(&self.tv, hr * 3);
         let t: Vec<i32> = read(&self.ti, hr * 3);
         Ok((0..hr).map(|r| [(v[r * 3], t[r * 3]), (v[r * 3 + 1], t[r * 3 + 1]), (v[r * 3 + 2], t[r * 3 + 2])]).collect())
@@ -1503,6 +1534,27 @@ impl Model {
             let (a, b) = (&w1[u as usize * r..(u as usize + 1) * r], &w2[v as usize * r..(v as usize + 1) * r]);
             a.iter().zip(b).map(|(&x, &y)| bf16_to_f32(x) * bf16_to_f32(y)).sum()
         };
+        if markov.is_some() && std::env::var("DSPARK_TREE").is_err() {
+            // DSpark is trained to draft a chain: at each position, argmax of base logit + Markov bias of the token before
+            let (w1, w2, r) = markov.unwrap();
+            let (mut toks, mut prev) = (vec![root], root);
+            let mut a = vec![0f32; r];
+            for d in 0..self.dcand.len().min(budget - 1) {
+                for (k, x) in w1[prev as usize * r..(prev as usize + 1) * r].iter().enumerate() { a[k] = bf16_to_f32(*x); }
+                let (mut bs, mut best) = (f32::MIN, -1);
+                for &(v, t) in &self.dcand[d] {
+                    let row = &w2[t as usize * r..(t as usize + 1) * r];
+                    let mut acc = 0f32;
+                    for k in 0..r { acc += a[k] * bf16_to_f32(row[k]); }
+                    if v + acc > bs { bs = v + acc; best = t; }
+                }
+                if best < 0 { break; }
+                toks.push(best);
+                prev = best;
+            }
+            let parent: Vec<i32> = (0..toks.len() as i32).map(|i| i - 1).collect();
+            return Ok((toks, parent));
+        }
         for &(v, t) in &top[0] {
             heap.push(C(v + bias(root, t), seq, 0, t));
             seq += 1;
@@ -1823,6 +1875,58 @@ fn main() -> Result<()> {
             }
         }
         m.lin_tree = false;
+        return Ok(());
+    }
+    if std::env::var("BENCH_PASS").is_ok() {
+        // matmul share of one 8-row verify pass: every target matrix (and the head) timed alone on the GPU clock.
+        // Bring the GPU up to full clock first (short bursts run at a lower one).
+        {
+            let l0 = unsafe { &*(&m.t.layers[0] as *const Layer) };
+            let (xh, xo, xs, out) = (m.xh.clone(), m.xo.clone(), m.xs.clone(), m.logits.clone());
+            let t0 = Instant::now();
+            while t0.elapsed().as_secs_f64() < 3.0 {
+                let cb = m.gpu.queue.commandBuffer().unwrap();
+                let e = cb.computeCommandEncoder().unwrap();
+                for _ in 0..100 { m.enc_qmm(&e, &l0.gu, [&xh, &xo, &xs], &out, 8, false)?; }
+                e.endEncoding(); cb.commit(); cb.waitUntilCompleted();
+            }
+        }
+        let mut cache: HashMap<(usize, usize), f64> = HashMap::new();
+        let mut time = |m: &mut Model, w: &QW| -> Result<f64> {
+            if let Some(&t) = cache.get(&(w.n, w.k)) { return Ok(t); }
+            let (xh, xo, xs, out) = (m.xh.clone(), m.xo.clone(), m.xs.clone(), m.logits.clone());
+            let mut best = f64::MAX;
+            for _ in 0..6 {
+                let cb = m.gpu.queue.commandBuffer().unwrap();
+                let e = cb.computeCommandEncoder().unwrap();
+                for _ in 0..60 { m.enc_qmm(&e, w, [&xh, &xo, &xs], &out, 8, false)?; }
+                e.endEncoding(); cb.commit(); cb.waitUntilCompleted();
+                best = best.min((cb.GPUEndTime() - cb.GPUStartTime()) / 60.0);
+            }
+            cache.insert((w.n, w.k), best);
+            Ok(best)
+        };
+        let (mut tot, mut bytes) = (0.0, 0usize);
+        let mut by: HashMap<&str, f64> = HashMap::new();
+        let n_layers = m.t.layers.len();
+        for i in 0..n_layers {
+            let l = unsafe { &*(&m.t.layers[i] as *const Layer) };
+            let kind = if l.sc.is_some() { "conv" } else if l.lin.is_some() { "linear" } else { "attn" };
+            let mut ws: Vec<(&str, &QW)> = vec![("in/qkv", &l.qkv), ("out", &l.o), ("gate+up", &l.gu), ("down", &l.down)];
+            if let Some(g) = &l.g4 { if let Some((a, b, _)) = &g.ple { ws.push(("ple", a)); ws.push(("ple", b)); } }
+            for (nm, w) in ws {
+                let t = time(&mut m, w)?;
+                tot += t; bytes += w.n * w.k / 2 + w.n * w.k / 64 * 4;
+                *by.entry(if nm == "in/qkv" || nm == "out" { kind } else { "mlp" }).or_default() += t;
+            }
+        }
+        let head = unsafe { &*(&m.head as *const QW) };
+        let th = time(&mut m, head)?;
+        let mut parts: Vec<_> = by.into_iter().collect();
+        parts.sort_by(|a, b| b.1.total_cmp(&a.1));
+        println!("8-row matmuls of one verify pass: {:.2} ms layers ({:.0} MB, {:.0} GB/s) + head {:.2} ms = {:.2} ms",
+                 tot * 1e3, bytes as f64 / 1e6, bytes as f64 / tot / 1e9, th * 1e3, (tot + th) * 1e3);
+        println!("  by part: {}", parts.iter().map(|(k, v)| format!("{k} {:.2} ms", v * 1e3)).collect::<Vec<_>>().join(", "));
         return Ok(());
     }
     if std::env::var("BENCH_QMM").is_ok() {
