@@ -40,7 +40,7 @@ pub(crate) fn read_g4(c: &serde_json::Value) -> Option<G4Cfg> {
 pub(crate) fn g4_at(g: &G4Cfg, hd_s: usize, h: usize, kvh: usize, sliding: bool, kvh_w: usize, src: usize) -> At {
     let hd = if sliding { hd_s } else { g.ghd };
     let rot = if sliding { hd } else { (hd as f32 * g.rot_f) as usize };
-    At { h, hd, kvh_w, kvh, src, w: if sliding { g.window } else { 0 }, theta: if sliding { g.theta_s } else { g.theta_f },
+    At { trad: false, h, hd, kvh_w, kvh, src, w: if sliding { g.window } else { 0 }, theta: if sliding { g.theta_s } else { g.theta_f },
          rot, ph: hd / 2, ed: hd, scale: 1.0, vnorm: true, qs: hd, gate: false }
 }
 

@@ -384,12 +384,13 @@ struct At {
     vnorm: bool,
     qs: usize,     // q head stride in the projection (2*hd with an output gate)
     gate: bool,
+    trad: bool,    // interleaved RoPE pairs (2j, 2j+1) instead of (i, i + hd/2)
 }
 
 impl At {
     fn qwen(c: &Cfg, i: usize) -> At {
         At { h: c.h, hd: c.hd, kvh_w: c.kvh, kvh: c.kvh, src: i, w: 0, theta: c.theta, rot: c.rot, ph: c.rot / 2, ed: c.rot,
-             scale: (c.hd as f32).powf(-0.5), vnorm: false, qs: c.qs(), gate: c.gate }
+             scale: (c.hd as f32).powf(-0.5), vnorm: false, qs: c.qs(), gate: c.gate, trad: c.trad }
     }
     fn qkvw(&self) -> usize { self.h * self.qs + 2 * self.kvh_w * self.hd }
 }
@@ -444,6 +445,7 @@ struct Cfg {
     gemma: Option<G4Cfg>,  // Gemma 4
     conv: Vec<bool>,       // per layer: LFM2 short convolution?
     lfm: bool,             // LFM2 weight names (operator_norm, feed_forward.w1/w3/w2, out_proj, q/k_layernorm)
+    trad: bool,            // interleaved RoPE (LFM2.5 DSpark drafters: rope_is_neox_style = false)
 }
 
 impl Cfg {
@@ -567,6 +569,7 @@ fn read_cfg(c: &serde_json::Value) -> Cfg {
         linear,
         gemma: read_g4(c),
         lfm: c["model_type"].as_str() == Some("lfm2"),
+        trad: c["rope_is_neox_style"].as_bool() == Some(false) && std::env::var("FORCE_NEOX").is_err(),
         conv,
     }
 }
@@ -669,6 +672,8 @@ struct Guesser {
     block: usize,
     c: usize,                // context words already in the guesser's memory
     pending: Vec<f32>,       // target features of committed words not yet in its memory [rows, F]
+    markov: Option<Weights>, // DSpark: low-rank bigram bias w1[prev] . w2[next] added to each drafted position
+    from_anchor: bool,       // DSpark: block row 0 (the anchor) predicts the first new word; DFlash: row 1 does
 }
 
 struct Model {
@@ -783,6 +788,7 @@ impl Model {
                 let tl: Vec<usize> = gc["dflash_config"]["target_layer_ids"].as_array().context("target_layer_ids")?
                     .iter().map(|x| x.as_u64().unwrap() as usize).collect();
                 let stack = load_stack(&gpu, &gw, &gcfg, gc["num_hidden_layers"].as_u64().unwrap() as usize, "", "norm.weight", maxlen, true)?;
+                let has_markov = gw.idx.contains_key("markov_head.markov_w1.weight");
                 Some(Guesser {
                     fc: repack(&gpu, &[gw.q4("fc")?], tl.len() * gcfg.d),
                     hidden_norm: gpu.buf_from(gw.u16s("hidden_norm.weight")?),
@@ -792,6 +798,8 @@ impl Model {
                     stack,
                     c: 0,
                     pending: Vec::new(),
+                    markov: if has_markov { Some(gw) } else { None },
+                    from_anchor: gc["sample_from_anchor"].as_bool().unwrap_or(gc["architectures"][0].as_str().unwrap_or("").contains("DSpark")),
                 })
             }
             None => None,
@@ -1081,7 +1089,7 @@ impl Model {
     fn enc_rope(&mut self, e: &Enc, c: &Cfg, heads: usize, src: &Buf, layer: &Layer, n_real: usize, p0: usize, n: usize, pos: &Buf) -> Result<()> {
         let a = &layer.at;
         let p = self.gpu.pipe("qk_rope", kernels::QK_ROPE, &[("H", heads.to_string()), ("KVH", a.kvh_w.to_string()), ("HD", a.hd.to_string()),
-            ("QS", a.qs.to_string()), ("ROT", a.rot.to_string()), ("PH", a.ph.to_string()), ("ED", a.ed.to_string()), ("VNORM", (a.vnorm as i32).to_string()),
+            ("QS", a.qs.to_string()), ("ROT", a.rot.to_string()), ("PH", a.ph.to_string()), ("ED", a.ed.to_string()), ("VNORM", (a.vnorm as i32).to_string()), ("TRAD", (a.trad as i32).to_string()),
             ("S", self.maxlen.to_string()), ("EPS", format!("{:e}f", c.eps)), ("THETA", format!("{:e}f", a.theta)),
             ("SCALE", format!("{:e}f", a.scale))])?;
         e.setComputePipelineState(&p);
@@ -1434,11 +1442,12 @@ impl Model {
         self.enc_stack(&e, &g.stack, n, b, g.c, g.c + b, &[])?;
         let head = unsafe { &*(&self.head as *const QW) };
         let logits = self.logits.clone();
-        // positions 1..=hr only (the tree cannot go deeper); x rows start at block row 1
-        let hr = (b - 1).min(want.max(1));
+        // the tree cannot go deeper than hr; x rows start at block row 1 (DFlash) or at the anchor row 0 (DSpark)
+        let first = if g.from_anchor { 0 } else { 1 };
+        let hr = (b - first).min(want.max(1));
         let hn = hr.div_ceil(8) * 8;
         let (nt, sk) = self.cfg_for(head.n, head.k, hn / 8);
-        self.enc_qmm_at(&e, head, [&xh, &xo, &xs], 1, &logits, hn, false, nt, sk)?;
+        self.enc_qmm_at(&e, head, [&xh, &xo, &xs], first, &logits, hn, false, nt, sk)?;
         let p_top = self.gpu.pipe("topk3", kernels::TOPK3, &[("V", gc.vocab.to_string())])?;
         e.setComputePipelineState(&p_top);
         let (tv, ti) = (self.tv.clone(), self.ti.clone());
@@ -1483,8 +1492,19 @@ impl Model {
         let (mut toks, mut parent, mut dep, mut score) = (vec![root], vec![-1i32], vec![0usize], vec![0f32]);
         let mut heap = BinaryHeap::new();
         let mut seq = 0;
+        // DSpark: each drafted position's logits get a bias from the token drafted before it (the parent in the tree)
+        let markov = self.g.as_ref().and_then(|g| g.markov.as_ref()).map(|w| {
+            let r = w.shape("markov_head.markov_w1.weight")[1];
+            (w.u16s("markov_head.markov_w1.weight").unwrap(), w.u16s("markov_head.markov_w2.weight").unwrap(), r)
+        });
+        let bias = |u: i32, v: i32| -> f32 {
+            let Some((w1, w2, r)) = markov else { return 0.0 };
+            if std::env::var("NO_MARKOV").is_ok() { return 0.0; }
+            let (a, b) = (&w1[u as usize * r..(u as usize + 1) * r], &w2[v as usize * r..(v as usize + 1) * r]);
+            a.iter().zip(b).map(|(&x, &y)| bf16_to_f32(x) * bf16_to_f32(y)).sum()
+        };
         for &(v, t) in &top[0] {
-            heap.push(C(v, seq, 0, t));
+            heap.push(C(v + bias(root, t), seq, 0, t));
             seq += 1;
         }
         while let Some(C(s, _, p, t)) = heap.pop() {
@@ -1498,7 +1518,7 @@ impl Model {
             let (c, d) = (toks.len() - 1, dep[toks.len() - 1]);
             if d < top.len() && d < MAXD - 1 {
                 for &(v, tt) in &top[d] {
-                    heap.push(C(s + v, seq, c, tt));
+                    heap.push(C(s + v + bias(t, tt), seq, c, tt));
                     seq += 1;
                 }
             }

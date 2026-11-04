@@ -201,6 +201,15 @@ kernel void qk_rope(const device float* qkv [[buffer(0)]], const device bfloat* 
     float p = float(pos[row]);
     float o[E];
     for (int e = 0; e < E; e++) o[e] = v[e];
+    if (TRAD) {                                 // interleaved: pair (2j, 2j + 1), all HD dims
+        for (int e = 0; e < E; e++) {
+            int i = int(lane) + 32 * e;
+            float inv = pow(THETA, -2.0f * float(i / 2) / float(ED));
+            float ang = p * inv, c = cos(ang), s = sin(ang);
+            float other = simd_shuffle_xor(v[e], 1);
+            o[e] = (i & 1) ? v[e] * c + other * s : v[e] * c - other * s;
+        }
+    } else
     for (int e = 0; e < ROT / 64; e++) {        // pair (i, i + PH), i = lane + 32e
         int i = int(lane) + 32 * e;
         float inv = pow(THETA, -2.0f * float(i) / float(ED));

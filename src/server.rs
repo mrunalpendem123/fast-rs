@@ -27,10 +27,22 @@ struct Job {
 
 pub(crate) fn template(dir: &PathBuf) -> Result<String> {
     if let Ok(s) = std::fs::read_to_string(dir.join("chat_template.jinja")) {
-        return Ok(s);
+        return Ok(hf_tags(s));
     }
     let tc: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("tokenizer_config.json"))?)?;
     Ok(tc["chat_template"].as_str().context("no chat template")?.to_string())
+}
+
+/// Hugging Face's {% generation %} ... {% endgeneration %} only marks the assistant's text for training masks; the
+/// same block as a plain if keeps the template's output and its whitespace control.
+fn hf_tags(s: String) -> String {
+    let mut s = s;
+    for (a, b) in [("generation", "if true"), ("endgeneration", "endif")] {
+        for (l, r) in [("{%- ", " -%}"), ("{% ", " %}"), ("{%- ", " %}"), ("{% ", " -%}")] {
+            s = s.replace(&format!("{l}{a}{r}"), &format!("{l}{b}{r}"));
+        }
+    }
+    s
 }
 
 pub(crate) fn render(env: &Environment, messages: &[Value]) -> Result<String> {
@@ -59,6 +71,7 @@ const CATALOG: &[(&str, &str, &str, usize)] = &[
     ("qwen3.5-4b", "qwen3.5-4b-4bit", "qwen3.5-4b-dflash", 24576),
     ("gemma-4-e2b", "gemma-4-e2b-mlx", "gemma-4-e2b-assistant", 32768),
     ("gemma-4-e4b", "gemma-4-e4b-mlx", "gemma-4-e4b-assistant", 16384),
+    ("lfm2.5-2.6b", "lfm2.5-2.6b-4bit", "lfm2.5-2.6b-dspark", 16384),
 ];
 
 pub(crate) struct Entry {

@@ -354,6 +354,7 @@ const MODELS = {
   "qwen3-4b": {name: "Qwen3-4B", info: "Best all-rounder · fastest on code and maths · 12k-token memory", load: 3, think: true, ctx: 12288},
   "qwen3.5-4b": {name: "Qwen3.5-4B", info: "Newer Qwen · 24k-token memory", load: 3, think: true, ctx: 24576},
   "gemma-4-e2b": {name: "Gemma 4 E2B", info: "Smallest and quickest to load · 32k-token memory", load: 2, think: false, ctx: 32768},
+  "lfm2.5-2.6b": {name: "LFM2.5-2.6B", info: "Liquid AI · always reasons first · 16k-token context", load: 3, think: true, always: true, ctx: 16384},
   "gemma-4-e4b": {name: "Gemma 4 E4B", info: "Larger Gemma · 16k-token memory", load: 5, think: false, ctx: 16384}
 };
 const GPU_LIMIT = 5.73;
@@ -565,8 +566,9 @@ function syncPicker() {
   ps.textContent = loaded ? "in memory" : status.loading === model ? "loading…" : `~${MODELS[model]?.load || 20} s to load`;
   ps.className = loaded ? "ok" : "";
   const can = !!MODELS[model]?.think;
-  $("think").disabled = !can; $("think").setAttribute("aria-pressed", String(can && settings.think));
-  $("think").title = can ? "Let the model reason before answering" : "This model has no thinking mode";
+  const always = !!MODELS[model]?.always;
+  $("think").disabled = !can || always; $("think").setAttribute("aria-pressed", String(can && (always || settings.think)));
+  $("think").title = always ? "This model always reasons before answering" : can ? "Let the model reason before answering" : "This model has no thinking mode";
   $("iname").textContent = nm(status.loaded || model);
   store.set("fastrs.model", model);
 }
@@ -695,7 +697,7 @@ async function send(opts = {}) {
     cur.messages.push({role: "user", content: text, files});
   }
   cur.model = model; saveChats(); renderThread(); renderRail();
-  const thinking = !!(MODELS[model]?.think && settings.think);
+  const thinking = !!(MODELS[model]?.always || (MODELS[model]?.think && settings.think));
   const msg = {role: "assistant", content: "", model, thinking}, loading = status.loaded !== model;
   const el = document.createElement("div"); el.className = "msg bot";
   el.innerHTML = whoHTML(msg, loading ? "loading" : "thinking", "live") + stageHTML(loading) + '<div class="tk"></div><div class="body"><div class="hd"></div><div class="tl"></div></div>';
