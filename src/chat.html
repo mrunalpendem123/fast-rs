@@ -351,10 +351,10 @@ body.app .ins { padding-top: 44px; }
 <script>
 /* ======================= data ======================= */
 const MODELS = {
-  "qwen3-4b": {name: "Qwen3-4B", info: "Best all-rounder · fastest on code and maths · 12k-token memory", load: 20, think: true, ctx: 12288},
-  "qwen3.5-4b": {name: "Qwen3.5-4B", info: "Newer Qwen · 24k-token memory", load: 30, think: true, ctx: 24576},
-  "gemma-4-e2b": {name: "Gemma 4 E2B", info: "Smallest and quickest to load · 32k-token memory", load: 8, think: false, ctx: 32768},
-  "gemma-4-e4b": {name: "Gemma 4 E4B", info: "Larger Gemma · 16k-token memory", load: 30, think: false, ctx: 16384}
+  "qwen3-4b": {name: "Qwen3-4B", info: "Best all-rounder · fastest on code and maths · 12k-token memory", load: 3, think: true, ctx: 12288},
+  "qwen3.5-4b": {name: "Qwen3.5-4B", info: "Newer Qwen · 24k-token memory", load: 3, think: true, ctx: 24576},
+  "gemma-4-e2b": {name: "Gemma 4 E2B", info: "Smallest and quickest to load · 32k-token memory", load: 2, think: false, ctx: 32768},
+  "gemma-4-e4b": {name: "Gemma 4 E4B", info: "Larger Gemma · 16k-token memory", load: 5, think: false, ctx: 16384}
 };
 const GPU_LIMIT = 5.73;
 // attached text may use about 40% of the model's chat memory (~3.5 characters per word), leaving room to answer
@@ -678,7 +678,7 @@ $("q").addEventListener("input", e => { query = e.target.value; renderRail(); })
 function stop() { if (!gen) return; gen.stopped = true; gen.ctrl.abort(); if (gen.reader) gen.reader.cancel().catch(() => {}); }
 
 function stageHTML(loading) {
-  if (loading) return `<div class="stage"><div class="iso" aria-hidden="true"><div class="stk"><i></i><i></i><i></i></div></div><div><h4>Loading ${esc(nm(model))}<span class="dots"></span></h4><p><span class="el">0.0 s</span> · weights → GPU memory · about ${MODELS[model]?.load || 20} s, only when switching models</p></div></div>`;
+  if (loading) return `<div class="stage"><div class="iso" aria-hidden="true"><div class="stk"><i></i><i></i><i></i></div></div><div><h4>Loading ${esc(nm(model))}<span class="dots"></span></h4><p><span class="el">0.0 s</span> · weights → GPU memory · about ${MODELS[model]?.load || 20} s, only when switching models · first load of a model builds its cache (~20–35 s)</p></div></div>`;
   return `<div class="stage"><canvas style="width:200px;height:56px" aria-hidden="true"></canvas><div><h4>Thinking<span class="dots"></span></h4><p><span class="el">0.0 s</span> · reading your message · drafting guesses</p></div></div>`;
 }
 async function send(opts = {}) {

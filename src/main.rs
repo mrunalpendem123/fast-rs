@@ -29,6 +29,8 @@ const MAXR: usize = 128; // rows per pass (prompt chunk)
 const LIN_R: usize = 4; // state rows per lane in the delta-rule kernel for chains (trees: 1, so branch states fit registers)
 
 thread_local! {
+    /// seconds spent compiling source, building pipelines, and how many kernels were built (for load-time reports)
+    pub static COMPILE_T: std::cell::Cell<(f64, f64, usize)> = const { std::cell::Cell::new((0.0, 0.0, 0)) };
     static PIPES: std::cell::RefCell<HashMap<String, Pipe>> = std::cell::RefCell::new(HashMap::new());
 }
 
@@ -62,11 +64,14 @@ impl Gpu {
         }
         s += kernels::GROUP_SUMS;
         s += src;
+        let t0 = Instant::now();
         let opts = MTLCompileOptions::new();
         let lib = self.dev.newLibraryWithSource_options_error(&NSString::from_str(&s), Some(&opts))
             .map_err(|e| anyhow!("compile {key}: {}", e.localizedDescription()))?;
         let f = lib.newFunctionWithName(&NSString::from_str(name)).context("function")?;
+        let t1 = Instant::now();
         let p = self.dev.newComputePipelineStateWithFunction_error(&f).map_err(|e| anyhow!("pipeline {key}: {}", e.localizedDescription()))?;
+        COMPILE_T.with(|c| { let (a, b, n) = c.get(); c.set((a + (t1 - t0).as_secs_f64(), b + t1.elapsed().as_secs_f64(), n + 1)); });
         if std::env::var("DEBUG_PIPES").is_ok() {
             eprintln!("{key}: max threads {} tg mem {}", p.maxTotalThreadsPerThreadgroup(), p.staticThreadgroupMemoryLength());
         }
@@ -124,11 +129,112 @@ struct Q4<'a> {
     rows: usize,
 }
 
+/// Repacked weights cached on disk, so a model loads by mapping one file instead of rebuilding every matrix.
+/// The first load of a model writes the file (in the order load() repacks); later loads hand the GPU no-copy views
+/// of it. File-backed pages are clean: under memory pressure macOS drops and re-reads them instead of swapping.
+/// Same bytes as a fresh repack, so outputs are unchanged.
+const WCACHE_VER: &str = "v7-lane-native-1";
+const PAGE: usize = 16384;
+
+enum WCache {
+    Read { map: std::sync::Arc<memmap2::MmapMut>, off: usize },
+    Write { f: std::io::BufWriter<std::fs::File>, off: usize, tmp: std::path::PathBuf, path: std::path::PathBuf },
+}
+
+thread_local! {
+    static WCACHE: std::cell::RefCell<Option<WCache>> = const { std::cell::RefCell::new(None) };
+}
+
+fn wcache_reading() -> bool {
+    WCACHE.with(|c| matches!(&*c.borrow(), Some(WCache::Read { .. })))
+}
+
+/// Cache file for (model, guesser): keyed by their files' names, sizes and dates and the layout version.
+fn wcache_path(dir: &Path, guesser: Option<&Path>) -> Option<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    WCACHE_VER.hash(&mut h);
+    for d in std::iter::once(dir).chain(guesser) {
+        let mut files: Vec<_> = std::fs::read_dir(d).ok()?.filter_map(|e| e.ok()).map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false)).collect();
+        files.sort();
+        for f in files {
+            let m = std::fs::metadata(&f).ok()?;
+            (f.to_string_lossy().to_string(), m.len(), m.modified().ok()).hash(&mut h);
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    Some(std::path::PathBuf::from(home).join(format!(".cache/fast-rs/weights-{:016x}.bin", h.finish())))
+}
+
+fn wcache_begin(dir: &Path, guesser: Option<&Path>) -> Option<std::sync::Arc<memmap2::MmapMut>> {
+    if std::env::var("FAST_NO_WCACHE").is_ok() {
+        return None;
+    }
+    let path = wcache_path(dir, guesser)?;
+    if let Ok(f) = std::fs::File::open(&path) {
+        // a private copy-on-write mapping: writable as Metal wants, still backed by the file
+        if let Ok(map) = unsafe { memmap2::MmapOptions::new().map_copy(&f) } {
+            let map = std::sync::Arc::new(map);
+            WCACHE.with(|c| *c.borrow_mut() = Some(WCache::Read { map: map.clone(), off: 0 }));
+            return Some(map);
+        }
+    }
+    let _ = std::fs::create_dir_all(path.parent()?);
+    let tmp = path.with_extension("tmp");
+    let f = std::fs::File::create(&tmp).ok()?;
+    WCACHE.with(|c| *c.borrow_mut() = Some(WCache::Write { f: std::io::BufWriter::with_capacity(1 << 22, f), off: 0, tmp, path }));
+    None
+}
+
+fn wcache_end() -> Result<()> {
+    match WCACHE.with(|c| c.borrow_mut().take()) {
+        Some(WCache::Write { f, tmp, path, .. }) => {
+            let f = f.into_inner().map_err(|e| anyhow!("weight cache: {e}"))?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &path)?;
+        }
+        Some(WCache::Read { map, off }) => anyhow::ensure!(off == map.len(), "weight cache size mismatch: rebuild by deleting it"),
+        None => {}
+    }
+    Ok(())
+}
+
+/// Drop a half-written cache file (a load that failed part way).
+fn wcache_abort() {
+    if let Some(WCache::Write { tmp, .. }) = WCACHE.with(|c| c.borrow_mut().take()) {
+        let _ = std::fs::remove_file(tmp);
+    }
+}
+
+fn padded(n: usize) -> usize {
+    n.div_ceil(PAGE) * PAGE
+}
+
 /// Several matrices stacked by rows -> v7 layout. Row tiles are independent, so they are split across all cores.
 fn repack(gpu: &Gpu, parts: &[Q4], k: usize) -> QW {
     let g_n = k / 64;
     let kw = k / 8;
     let n: usize = parts.iter().map(|p| p.rows).sum();
+    let sizes = [n / 8 * g_n * 32 * 2 * 4, n / 8 * g_n * 8 * 2, n / 8 * g_n * 8 * 2];
+    let cached = WCACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let Some(WCache::Read { map, off }) = &mut *c else { return None };
+        let mut bufs = Vec::new();
+        for &sz in &sizes {
+            if *off + padded(sz) > map.len() {
+                return None;
+            }
+            let ptr = NonNull::new(unsafe { map.as_ptr().add(*off) } as *mut c_void).unwrap();
+            bufs.push(unsafe { gpu.dev.newBufferWithBytesNoCopy_length_options_deallocator(ptr, padded(sz), MTLResourceOptions::StorageModeShared, None) }?);
+            *off += padded(sz);
+        }
+        Some(bufs)
+    });
+    if let Some(mut b) = cached {
+        let (bp, sp, wq) = (b.pop().unwrap(), b.pop().unwrap(), b.pop().unwrap());
+        return QW { wq, sp, bp, n, k };
+    }
     let mut wq = vec![0u32; n / 8 * g_n * 32 * 2];
     let mut sp = vec![0u16; n / 8 * g_n * 8];
     let mut bp = vec![0u16; n / 8 * g_n * 8];
@@ -181,6 +287,23 @@ fn repack(gpu: &Gpu, parts: &[Q4], k: usize) -> QW {
                 }
             });
             t0 += cnt;
+        }
+    });
+    WCACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let failed = if let Some(WCache::Write { f, off, .. }) = &mut *c {
+            use std::io::Write;
+            let mut put = |p: *const u8, n: usize| -> std::io::Result<()> {
+                f.write_all(unsafe { std::slice::from_raw_parts(p, n) })?;
+                f.write_all(&vec![0u8; padded(n) - n])?;
+                *off += padded(n);
+                Ok(())
+            };
+            put(wq.as_ptr() as *const u8, sizes[0]).and_then(|_| put(sp.as_ptr() as *const u8, sizes[1]))
+                .and_then(|_| put(bp.as_ptr() as *const u8, sizes[2])).is_err()
+        } else { false };
+        if failed {
+            if let Some(WCache::Write { tmp, .. }) = c.take() { let _ = std::fs::remove_file(tmp); } // e.g. disk full: just don't cache
         }
     });
     QW { wq: gpu.buf_from(&wq), sp: gpu.buf_from(&sp), bp: gpu.buf_from(&bp), n, k }
@@ -364,6 +487,10 @@ impl Weights {
     }
     /// A linear layer as Q4: already 4-bit (MLX), or bf16 quantized here.
     fn q4(&self, name: &str) -> Result<Q4<'_>> {
+        if wcache_reading() {
+            // only the row count is needed: repack() takes the matrix from the cache file
+            return Ok(Q4 { w: Vec::new().into(), s: Vec::new().into(), b: Vec::new().into(), rows: self.shape(&format!("{name}.weight"))[0] });
+        }
         if self.idx.contains_key(&format!("{name}.scales")) {
             Ok(Q4 { w: self.u32s(&format!("{name}.weight"))?.into(), s: self.u16s(&format!("{name}.scales"))?.into(),
                     b: self.u16s(&format!("{name}.biases"))?.into(), rows: self.shape(&format!("{name}.weight"))[0] })
@@ -560,6 +687,7 @@ struct Model {
     rscale: Buf,         // [rows]: power-of-two input scale of the last prep (rows past half's range)
     rs_next: bool,       // the next matmul multiplies its rows back by rscale
     pub prof: [f64; 4],  // assistant: GPU wait s, CPU head s, rounds
+    wmap: Option<std::sync::Arc<memmap2::MmapMut>>, // weight cache mapping; declared last so the GPU buffers go first
 }
 
 impl Model {
@@ -568,6 +696,22 @@ impl Model {
     }
 
     fn load(dir: &Path, guesser: Option<&Path>, maxlen: usize) -> Result<Self> {
+        let wmap = wcache_begin(dir, guesser);
+        let r = Self::load_inner(dir, guesser, maxlen);
+        match r {
+            Ok(mut m) => {
+                if let Err(e) = wcache_end() { eprintln!("{e}"); }
+                m.wmap = wmap;
+                Ok(m)
+            }
+            Err(e) => {
+                wcache_abort();
+                Err(e)
+            }
+        }
+    }
+
+    fn load_inner(dir: &Path, guesser: Option<&Path>, maxlen: usize) -> Result<Self> {
         let gpu = Gpu::new()?;
         let c: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
         if c["quantization"]["bits"].as_i64() != Some(4) || c["quantization"]["group_size"].as_i64() != Some(64) {
@@ -684,6 +828,7 @@ impl Model {
             rscale: rsb,
             rs_next: false,
             prof: [0.0; 4],
+            wmap: None,
         })
     }
 

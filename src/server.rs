@@ -77,7 +77,7 @@ struct Loaded {
     m: Model,
 }
 
-fn load(e: &Entry) -> Result<Loaded> {
+fn load(e: &Entry, ctx: usize) -> Result<Loaded> {
     let t0 = Instant::now();
     let tok = Tokenizer::from_file(e.model.join("tokenizer.json")).map_err(|x| anyhow!("tokenizer: {x}"))?;
     let src = template(&e.model)?;
@@ -97,16 +97,24 @@ fn load(e: &Entry) -> Result<Loaded> {
             eos.push(id as i32);
         }
     }
-    let ctx = ctx_for(e);
     let mut m = Model::load(&e.model, e.guesser.as_deref(), ctx)?;
     let t1 = Instant::now();
     m.autotune()?;
     let t2 = Instant::now();
     let warm: Vec<i32> = tok.encode(render(&env, &[json!({"role": "user", "content": "Hi"})])?, false).map_err(|x| anyhow!("{x}"))?
         .get_ids().iter().map(|&x| x as i32).collect();
+    let tw = Instant::now();
     m.generate(&warm, 8, &eos, budget(), &mut |_| true)?;
+    let w1 = tw.elapsed().as_secs_f64();
+    if std::env::var("WARM2").is_ok() {
+        let tw = Instant::now();
+        m.generate(&warm, 8, &eos, budget(), &mut |_| true)?;
+        eprintln!("warm-up generate: first {w1:.1}s, second {:.2}s", tw.elapsed().as_secs_f64());
+    }
     m.reuse = true; // follow-up messages keep the memory of the conversation so far (exact: same words as rereading it)
     m.turn_tok = ["<|im_start|>", "<|turn>", "<start_of_turn>"].iter().find_map(|t| tok.token_to_id(t)).map(|x| x as i32);
+    let (cs, cp, cn) = crate::COMPILE_T.with(|c| c.replace((0.0, 0.0, 0)));
+    eprintln!("kernels: {cn} built, source compile {cs:.1}s, pipeline {cp:.1}s");
     eprintln!("loaded {} in {:.1}s (weights {:.1}s, tune {:.1}s, warm-up {:.1}s), {} words of context, GPU memory {:.2} GB", e.id,
               t0.elapsed().as_secs_f64(), (t1 - t0).as_secs_f64(), (t2 - t1).as_secs_f64(), t2.elapsed().as_secs_f64(), ctx,
               m.gpu_bytes() as f64 / 1e9);
@@ -114,6 +122,15 @@ fn load(e: &Entry) -> Result<Loaded> {
 }
 
 /// Words of conversation the engine keeps in memory (question + history + answer). FAST_CTX overrides.
+/// Chat memory a model starts with. Most chats fit; a longer one reloads the model with its full memory (ctx_for).
+/// Starting small keeps ~1-2 GB of key/value memory out of the first GPU touch, which on an 8 GB Mac otherwise
+/// pushes macOS into swap and makes every model switch take 10+ s longer.
+const START_CTX: usize = 6144;
+
+fn start_ctx(e: &Entry) -> usize {
+    ctx_for(e).min(std::env::var("FAST_START").ok().and_then(|v| v.parse().ok()).unwrap_or(START_CTX))
+}
+
 fn ctx_for(e: &Entry) -> usize {
     std::env::var("FAST_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(e.ctx)
 }
@@ -124,9 +141,9 @@ fn budget() -> usize {
 
 fn engine(entries: Vec<Entry>, rx: Receiver<Job>, ready: Sender<String>, status: Arc<Mutex<Value>>) -> Result<()> {
     *status.lock().unwrap() = json!({"loaded": null, "loading": entries[0].id});
-    let mut cur = Some(load(&entries[0])?);
+    let mut cur = Some(load(&entries[0], start_ctx(&entries[0]))?);
     *status.lock().unwrap() = json!({"loaded": entries[0].id, "loading": null, "gpu_gb": cur.as_ref().map(|l| l.m.gpu_bytes() as f64 / 1e9),
-                                     "context": cur.as_ref().map(|l| l.ctx)});
+                                     "context": ctx_for(&entries[0])});
     let _ = ready.send(entries[0].id.clone());
     while let Ok(job) = rx.recv() {
         let r = (|| -> Result<Value> {
@@ -135,43 +152,76 @@ fn engine(entries: Vec<Entry>, rx: Receiver<Job>, ready: Sender<String>, status:
                 if cur.as_ref().map(|l| l.id != e.id).unwrap_or(true) {
                     cur = None;
                     *status.lock().unwrap() = json!({"loaded": null, "loading": e.id});
-                    let l = load(e);
+                    let l = load(e, start_ctx(e));
                     *status.lock().unwrap() = json!({"loaded": l.as_ref().ok().map(|l| l.id.clone()), "loading": null,
-                        "gpu_gb": l.as_ref().ok().map(|l| l.m.gpu_bytes() as f64 / 1e9), "context": l.as_ref().ok().map(|l| l.ctx)});
+                        "gpu_gb": l.as_ref().ok().map(|l| l.m.gpu_bytes() as f64 / 1e9), "context": ctx_for(e)});
                     cur = Some(l?);
                 }
             }
-            let l = cur.as_mut().context("no model loaded")?;
+            let entry = entries.iter().find(|e| Some(&e.id) == cur.as_ref().map(|l| &l.id)).context("no model loaded")?;
+            let full = ctx_for(entry);
+            // grow the chat memory: reload this model at its full size (the outputs are identical, it only re-reads the prompt)
+            let grow = |cur: &mut Option<Loaded>| -> Result<()> {
+                *cur = None;
+                *status.lock().unwrap() = json!({"loaded": null, "loading": entry.id, "growing": true});
+                let l = load(entry, full);
+                *status.lock().unwrap() = json!({"loaded": l.as_ref().ok().map(|l| l.id.clone()), "loading": null,
+                    "gpu_gb": l.as_ref().ok().map(|l| l.m.gpu_bytes() as f64 / 1e9), "context": full});
+                *cur = Some(l?);
+                Ok(())
+            };
             // long chats: drop the oldest turns (keeping any system message) until the prompt leaves room to answer
             let mut msgs = job.messages.clone();
             let ids: Vec<i32> = loop {
+                let l = cur.as_ref().context("no model loaded")?;
                 let text = render_with(&l.env, &msgs, job.think)?;
                 let ids: Vec<i32> = l.tok.encode(text, false).map_err(|e| anyhow!("{e}"))?.get_ids().iter().map(|&x| x as i32).collect();
                 let first = msgs.iter().position(|m| m["role"] != "system").unwrap_or(0);
-                if ids.len() + 1024 <= l.ctx || msgs.len() - first <= 1 { break ids; }
+                if ids.len() + 1024 <= full || msgs.len() - first <= 1 { break ids; }
                 msgs.remove(first);
             };
-            anyhow::ensure!(ids.len() + 64 < l.ctx, "the message is too long for this model's memory ({} words)", ids.len());
-            let max = job.max.min(l.ctx - ids.len() - 32);
+            anyhow::ensure!(ids.len() + 64 < full, "the message is too long for this model's memory ({} tokens)", ids.len());
+            if ids.len() + 1024 > cur.as_ref().unwrap().ctx { grow(&mut cur)?; }
             let mut words: Vec<u32> = Vec::new();
+            let mut emitted: Vec<i32> = Vec::new(); // every emitted token, to continue after a memory grow
             let mut sent = String::new();
             let t0 = Instant::now();
-            let (tok, eos) = (&l.tok, &l.eos);
-            let (_, passes) = l.m.generate(&ids, max, eos, budget(), &mut |w| {
-                words.extend(w.iter().filter(|x| !eos.contains(x)).map(|&x| x as u32));
-                let s = tok.decode(&words, true).unwrap_or_default();
-                if s.len() > sent.len() && !s.ends_with('\u{fffd}') {
-                    if job.out.send(Ev::Text(s[sent.len()..].to_string())).is_err() {
-                        return false;
+            let (mut passes, mut limited) = (0usize, false);
+            loop {
+                let l = cur.as_mut().context("no model loaded")?;
+                let mut prompt = ids.clone();
+                prompt.extend_from_slice(&emitted);
+                let room = l.ctx - prompt.len() - 32;
+                let want = job.max.saturating_sub(emitted.len());
+                let max = want.min(room);
+                let (tok, eos) = (&l.tok, &l.eos);
+                let before = emitted.len();
+                let mut stopped = false;
+                let (_, np) = l.m.generate(&prompt, max, eos, budget(), &mut |w| {
+                    emitted.extend_from_slice(w);
+                    words.extend(w.iter().filter(|x| !eos.contains(x)).map(|&x| x as u32));
+                    let s = tok.decode(&words, true).unwrap_or_default();
+                    if s.len() > sent.len() && !s.ends_with('\u{fffd}') {
+                        if job.out.send(Ev::Text(s[sent.len()..].to_string())).is_err() {
+                            stopped = true;
+                            return false;
+                        }
+                        sent = s;
                     }
-                    sent = s;
-                }
-                true
-            })?;
+                    true
+                })?;
+                passes += np;
+                let ended = emitted.last().map(|t| eos.contains(t)).unwrap_or(false);
+                let hit_room = emitted.len() - before >= max && max < want;
+                if stopped || ended || !hit_room { limited = !ended && !stopped && emitted.len() - before >= max; break; }
+                if l.ctx >= full { limited = true; break; }
+                grow(&mut cur)?; // ran out of memory mid-answer: grow it and carry on from the same tokens
+            }
+            let l = cur.as_ref().context("no model loaded")?;
             let dt = t0.elapsed().as_secs_f64();
-            eprintln!("{} | {} prompt words | {} words in {dt:.2}s = {:.1} words/s, {:.2} words/check", l.id,
+            eprintln!("{} | {} prompt tokens | {} tokens in {dt:.2}s = {:.1} tok/s, {:.2} tokens/pass", l.id,
                       ids.len(), words.len(), words.len() as f64 / dt, words.len() as f64 / passes.max(1) as f64);
-            let finish = if words.len() >= max { "length" } else { "stop" };
+            let finish = if limited { "length" } else { "stop" };
             Ok(json!({"model": l.id, "words": words.len(), "seconds": dt, "checks": passes, "prompt_words": ids.len(), "finish": finish}))
         })();
         let _ = job.out.send(match r { Ok(v) => Ev::Done(v), Err(e) => Ev::Err(e.to_string()) });
