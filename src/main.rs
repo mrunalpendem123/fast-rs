@@ -1534,6 +1534,43 @@ impl Model {
             let (a, b) = (&w1[u as usize * r..(u as usize + 1) * r], &w2[v as usize * r..(v as usize + 1) * r]);
             a.iter().zip(b).map(|(&x, &y)| bf16_to_f32(x) * bf16_to_f32(y)).sum()
         };
+        if markov.is_some() && !self.dcand.is_empty() && std::env::var("DSPARK_CHAIN").is_err() {
+            // DSpark tree: best-first by path probability, each child scored as softmax over the candidates of
+            // (base logit + Markov bias of its own parent's token): confident positions stay a chain, unsure ones branch
+            let (w1, w2, r) = markov.unwrap();
+            let kids = |u: i32, d: usize| -> Vec<(f32, i32)> {
+                let a: Vec<f32> = w1[u as usize * r..(u as usize + 1) * r].iter().map(|&x| bf16_to_f32(x)).collect();
+                let mut sc: Vec<(f32, i32)> = self.dcand[d].iter().map(|&(v, t)| {
+                    let row = &w2[t as usize * r..(t as usize + 1) * r];
+                    let mut acc = 0f32;
+                    for k in 0..r { acc += a[k] * bf16_to_f32(row[k]); }
+                    (v + acc, t)
+                }).collect();
+                let m = sc.iter().fold(f32::MIN, |x, y| x.max(y.0));
+                let lse = m + sc.iter().map(|x| (x.0 - m).exp()).sum::<f32>().ln();
+                sc.sort_by(|x, y| y.0.total_cmp(&x.0));
+                sc.truncate(4);
+                sc.into_iter().map(|(x, t)| (x - lse, t)).collect()
+            };
+            let hr = self.dcand.len();
+            let (mut toks, mut parent, mut dep) = (vec![root], vec![-1i32], vec![0usize]);
+            let mut heap = BinaryHeap::new();
+            let mut seq = 0;
+            for (lp, t) in kids(root, 0) { heap.push(C(lp, seq, 0, t)); seq += 1; }
+            while let Some(C(sc, _, p, t)) = heap.pop() {
+                if toks.len() >= budget { break; }
+                toks.push(t); parent.push(p as i32); dep.push(dep[p] + 1);
+                let (c, d) = (toks.len() - 1, dep[toks.len() - 1]);
+                if d < hr && d < MAXD - 1 {
+                    for (lp, tt) in kids(t, d) { heap.push(C(sc + lp, seq, c, tt)); seq += 1; }
+                }
+            }
+            let mut order: Vec<usize> = (0..toks.len()).collect();
+            order.sort_by_key(|&i| (dep[i], i));
+            let mut new = vec![0usize; toks.len()];
+            for (j, &o) in order.iter().enumerate() { new[o] = j; }
+            return Ok((order.iter().map(|&o| toks[o]).collect(), order.iter().map(|&o| if parent[o] >= 0 { new[parent[o] as usize] as i32 } else { -1 }).collect()));
+        }
         if markov.is_some() && std::env::var("DSPARK_TREE").is_err() {
             // DSpark is trained to draft a chain: at each position, argmax of base logit + Markov bias of the token before
             let (w1, w2, r) = markov.unwrap();
