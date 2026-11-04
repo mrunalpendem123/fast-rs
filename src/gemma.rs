@@ -73,6 +73,7 @@ pub(crate) fn gemma_layer(gpu: &Gpu, w: &Weights, cfg: &Cfg, i: usize, p: &str, 
         None
     };
     Ok(Layer {
+        sc: None,
         qkv,
         kv: None,
         o: repack(gpu, &[w.q4(&format!("{a}o_proj"))?], cfg.h * at.hd),
@@ -168,6 +169,7 @@ impl Asst {
             let at = g4_at(&g, cfg.hd, cfg.h, target.layers[src(sl)].at.kvh_w, sl, 0, src(sl));
             let q4 = |n: &str| -> Result<Q4<'static>> { let sh = w.shape(&format!("{n}.weight")); Ok(quant4(w.u16s(&format!("{n}.weight"))?, sh[0], sh[1])) };
             layers.push(Layer {
+                sc: None,
                 qkv: repack(gpu, &[q4(&format!("{a}q_proj"))?], cfg.d),
                 kv: None,
                 o: repack(gpu, &[q4(&format!("{a}o_proj"))?], cfg.h * at.hd),
@@ -272,7 +274,7 @@ impl Model {
     }
 
     /// float rows [n][kd] -> xh/xo/xs (no norm).
-    fn enc_prep(&mut self, e: &Enc, x: &Buf, kd: usize, n: usize) -> Result<()> {
+    pub(crate) fn enc_prep(&mut self, e: &Enc, x: &Buf, kd: usize, n: usize) -> Result<()> {
         self.enc_prep_with(e, x, kd, n, false)
     }
 

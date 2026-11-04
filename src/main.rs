@@ -357,6 +357,13 @@ struct Layer {
     lin: Option<Lin>, // Gated DeltaNet layer (Qwen3.5): qkv = [in_proj_qkv | z | b | a], o = out_proj
     at: At,           // this layer's attention shape
     g4: Option<G4L>,  // Gemma 4: sandwich norms, per-layer input, layer scalar
+    sc: Option<SConv>, // LFM2 short-convolution layer: qkv = in_proj [B | C | x], o = out_proj
+}
+
+/// An LFM2 short-convolution layer's taps and its per-position cache of B*x (bf16 [slots][D]).
+struct SConv {
+    w: Buf,
+    cache: Buf,
 }
 
 /// One attention layer's shape. Gemma 4 mixes sliding layers (head 256) with full ones (head 512) and lets later
@@ -435,6 +442,8 @@ struct Cfg {
     lin: Option<LinCfg>,
     linear: Vec<bool>,     // per layer: linear attention?
     gemma: Option<G4Cfg>,  // Gemma 4
+    conv: Vec<bool>,       // per layer: LFM2 short convolution?
+    lfm: bool,             // LFM2 weight names (operator_norm, feed_forward.w1/w3/w2, out_proj, q/k_layernorm)
 }
 
 impl Cfg {
@@ -541,6 +550,7 @@ fn read_cfg(c: &serde_json::Value) -> Cfg {
     let hd = c["head_dim"].as_u64().map(|x| x as usize).unwrap_or(d / h);
     let n = f("num_hidden_layers") as usize;
     let linear: Vec<bool> = (0..n).map(|i| c["layer_types"][i].as_str() == Some("linear_attention")).collect();
+    let conv: Vec<bool> = (0..n).map(|i| c["layer_types"][i].as_str() == Some("conv")).collect();
     Cfg {
         d,
         h,
@@ -548,7 +558,7 @@ fn read_cfg(c: &serde_json::Value) -> Cfg {
         hd,
         inter: f("intermediate_size") as usize,
         vocab: f("vocab_size") as usize,
-        eps: f("rms_norm_eps") as f32,
+        eps: c["rms_norm_eps"].as_f64().or(c["norm_eps"].as_f64()).unwrap_or(1e-6) as f32,
         theta: c["rope_theta"].as_f64().or(rp["rope_theta"].as_f64()).unwrap_or(1e6) as f32,
         rot: (hd as f64 * rp["partial_rotary_factor"].as_f64().or(c["partial_rotary_factor"].as_f64()).unwrap_or(1.0)) as usize,
         gate: c["attn_output_gate"].as_bool().unwrap_or(false),
@@ -556,6 +566,8 @@ fn read_cfg(c: &serde_json::Value) -> Cfg {
             dk: f("linear_key_head_dim") as usize, dv: f("linear_value_head_dim") as usize }),
         linear,
         gemma: read_g4(c),
+        lfm: c["model_type"].as_str() == Some("lfm2"),
+        conv,
     }
 }
 
@@ -593,11 +605,38 @@ fn load_stack(gpu: &Gpu, w: &Weights, cfg: &Cfg, n_layers: usize, pre: &str, nor
                 }),
                 at: At::qwen(cfg, i),
                 g4: None,
+                sc: None,
             });
             continue;
         }
         if cfg.gemma.is_some() {
             layers.push(gemma_layer(gpu, w, cfg, i, &p, maxlen)?);
+            continue;
+        }
+        if cfg.lfm {
+            let f = format!("{p}feed_forward.");
+            let conv = cfg.conv.get(i) == Some(&true);
+            let mut at = At::qwen(cfg, i);
+            let (qkv, o, qn, kn, kc, vc, sc) = if conv {
+                at.kvh_w = 0; // no keys or values: commit and attention skip it
+                let cv = format!("{p}conv.");
+                (repack(gpu, &[w.q4(&format!("{cv}in_proj"))?], cfg.d), repack(gpu, &[w.q4(&format!("{cv}out_proj"))?], cfg.d),
+                 gpu.buf(16), gpu.buf(16), gpu.buf(16), gpu.buf(16),
+                 Some(SConv { w: gpu.buf_from(w.u16s(&format!("{cv}conv.weight"))?), cache: gpu.buf(maxlen * cfg.d * 2) }))
+            } else {
+                (repack(gpu, &[w.q4(&format!("{a}q_proj"))?, w.q4(&format!("{a}k_proj"))?, w.q4(&format!("{a}v_proj"))?], cfg.d),
+                 repack(gpu, &[w.q4(&format!("{a}out_proj"))?], cfg.h * cfg.hd),
+                 gpu.buf_from(w.u16s(&format!("{a}q_layernorm.weight"))?), gpu.buf_from(w.u16s(&format!("{a}k_layernorm.weight"))?),
+                 gpu.buf(kvbytes), gpu.buf(kvbytes), None)
+            };
+            layers.push(Layer {
+                qkv, kv: None, o,
+                gu: repack(gpu, &[w.q4(&format!("{f}w1"))?, w.q4(&format!("{f}w3"))?], cfg.d),
+                down: repack(gpu, &[w.q4(&format!("{f}w2"))?], cfg.inter),
+                in_n: gpu.buf_from(w.u16s(&format!("{p}operator_norm.weight"))?),
+                post_n: gpu.buf_from(w.u16s(&format!("{p}ffn_norm.weight"))?),
+                qn, kn, kc, vc, lin: None, at, g4: None, sc,
+            });
             continue;
         }
         layers.push(Layer {
@@ -615,6 +654,7 @@ fn load_stack(gpu: &Gpu, w: &Weights, cfg: &Cfg, n_layers: usize, pre: &str, nor
             lin: None,
             at: At::qwen(cfg, i),
             g4: None,
+            sc: None,
         });
     }
     Ok(Stack { cfg: cfg.clone(), layers, norm: gpu.buf_from(w.u16s(norm)?) })
@@ -724,7 +764,8 @@ impl Model {
         let lm = if w.idx.contains_key("language_model.model.embed_tokens.weight") { "language_model." } else { "" };
         let epre = format!("{lm}model.embed_tokens");
         let t0 = Instant::now();
-        let t = load_stack(&gpu, &w, &cfg, cfg.linear.len(), &format!("{lm}model."), &format!("{lm}model.norm.weight"), maxlen, false)?;
+        let fnorm = if cfg.lfm { format!("{lm}model.embedding_norm.weight") } else { format!("{lm}model.norm.weight") };
+        let t = load_stack(&gpu, &w, &cfg, cfg.linear.len(), &format!("{lm}model."), &fnorm, maxlen, false)?;
         let tie = tc["tie_word_embeddings"].as_bool().or(c["tie_word_embeddings"].as_bool()).unwrap_or(false);
         let head = repack(&gpu, &[if tie { w.q4(&epre)? } else { w.q4(&format!("{lm}lm_head"))? }], cfg.d);
         let g4m = if cfg.gemma.is_some() { Some(G4M::load(&gpu, &w, lm, &cfg, MAXR)?) } else { None };
@@ -1091,6 +1132,8 @@ impl Model {
             }
             if let Some(lin) = &l.lin {
                 self.enc_lin(e, &c, l, lin, n, n_real)?;
+            } else if let Some(sc) = &l.sc {
+                self.enc_sconv(e, c.d, l, sc, n, n_real, p0)?;
             } else {
                 self.enc_qmm(e, &l.qkv, [xh, xo, xs], qkv, n, false)?;
                 let pos = self.pos.clone();
@@ -1173,6 +1216,50 @@ impl Model {
         self.enc_qmm(e, &l.o, [xh, xo, xs], h, n, true)
     }
 
+    /// LFM2 short-convolution layer over the n rows prepared in xh: in_proj, conv over each row's own predecessors,
+    /// out_proj added to h.
+    fn enc_sconv(&mut self, e: &Enc, d: usize, l: &Layer, sc: &SConv, n: usize, n_real: usize, p0: usize) -> Result<()> {
+        let b = [self.xh.clone(), self.xo.clone(), self.xs.clone(), self.qkv.clone(), self.tmp.clone(), self.lin_prev.clone()];
+        let [xh, xo, xs, bcx, y, prv] = &b;
+        self.enc_qmm(e, &l.qkv, [xh, xo, xs], bcx, n, false)?;
+        let defs = [("D", d.to_string())];
+        let pw = self.gpu.pipe("sconv_write", kernels::SCONV, &defs)?;
+        e.setComputePipelineState(&pw);
+        bind(e, &[bcx, &sc.cache]);
+        set_args(e, &[n_real as i32, p0 as i32], 2);
+        e.dispatchThreads_threadsPerThreadgroup(MTLSize { width: d, height: n, depth: 1 }, sz(256));
+        let pc = self.gpu.pipe("sconv", kernels::SCONV, &defs)?;
+        e.setComputePipelineState(&pc);
+        bind(e, &[bcx, &sc.cache, &sc.w, prv, y]);
+        set_args(e, &[n_real as i32, p0 as i32], 5);
+        e.dispatchThreads_threadsPerThreadgroup(MTLSize { width: d, height: n, depth: 1 }, sz(256));
+        self.enc_prep(e, y, d, n)?;
+        self.enc_qmm(e, &l.o, [xh, xo, xs], &self.h.clone(), n, true)
+    }
+
+    /// Each row's two predecessor slots for the short-convolution layers (chain: the slots before it; tree: its path,
+    /// continuing into the committed words before the root).
+    fn write_sconv(&self, rows: &[[i32; 4]], anc: &[[i32; MAXD]], n_real: usize, n: usize) {
+        if !self.t.cfg.conv.iter().any(|&x| x) {
+            return;
+        }
+        let p = self.p as i32;
+        let mut prv = vec![-1i32; n * 2];
+        for r in 0..n_real {
+            let up: Vec<i32> = if self.lin_tree {
+                let na = rows[r][2] as usize; // path root..r, slots p + node
+                (0..na.saturating_sub(1)).rev().map(|k| anc[r][k]).chain([p - 1, p - 2]).take(2).collect()
+            } else {
+                let s = p + r as i32;
+                vec![s - 1, s - 2]
+            };
+            for k in 0..2 {
+                prv[r * 2 + k] = if up[k] >= 0 { up[k] } else { -1 };
+            }
+        }
+        write(&self.lin_prev, &prv);
+    }
+
     /// Each row's conv history and state parent for the linear layers (chain: the rows before it; tree: its path).
     fn write_lin(&self, rows: &[[i32; 4]], anc: &[[i32; MAXD]], n_real: usize, n: usize) {
         if self.t.cfg.lin.is_none() {
@@ -1218,6 +1305,7 @@ impl Model {
         let n_real = ids.len();
         let n = self.write_rows(ids, pos, rows, anc);
         self.write_lin(rows, anc, n_real, n);
+        self.write_sconv(rows, anc, n_real, n);
         let cap: Vec<usize> = self.g.as_ref().map(|g| g.target_layers.clone()).unwrap_or_default();
         let t = unsafe { &*(&self.t as *const Stack) };
         let (d, vocab) = (t.cfg.d, t.cfg.vocab);
@@ -1497,6 +1585,16 @@ impl Model {
                             }
                         }
                     }
+                }
+            }
+        }
+        for l in &self.t.layers {
+            let Some(sc) = &l.sc else { continue };
+            let row_bytes = self.t.cfg.d * 2;
+            let base = sc.cache.contents().as_ptr() as *mut u8;
+            for (i, &node) in acc.iter().enumerate() {
+                if node != i {
+                    unsafe { std::ptr::copy(base.add((self.p + node) * row_bytes), base.add((self.p + i) * row_bytes), row_bytes) };
                 }
             }
         }

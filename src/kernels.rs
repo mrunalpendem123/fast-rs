@@ -675,3 +675,33 @@ kernel void asst_head(const device half* xh [[buffer(0)]], const device bfloat* 
     }
 }
 "#;
+
+/// LFM2 short convolution (depthwise, 3 taps) on the in_proj rows bcx = [B | C | x]. sconv_write puts each row's B*x
+/// into the layer's cache at slot p0 + row (like keys and values: a tree node's slot is p0 + its index, and commit moves
+/// accepted ones). sconv then reads, for every row, its own value and its two predecessors' from the cache: prv holds their
+/// slots (chain: the slots before it; tree: its parent and grandparent on its path; -1: before the text = 0), so a word's
+/// numbers are the same in a prompt chunk, a single step or a guess tree. y = C * (w2*bx + w1*bx[-1] + w0*bx[-2]).
+/// Defines: D.
+pub const SCONV: &str = r#"
+struct SArgs { int n; int p0; };
+kernel void sconv_write(const device float* bcx [[buffer(0)]], device bfloat* cache [[buffer(1)]], constant SArgs& a [[buffer(2)]],
+                        uint2 g [[thread_position_in_grid]]) {
+    int c = int(g.x), r = int(g.y);
+    if (c >= D || r >= a.n) return;
+    const device float* row = bcx + long(r) * 3 * D;
+    cache[long(a.p0 + r) * D + c] = bfloat(row[c] * row[2 * D + c]);
+}
+kernel void sconv(const device float* bcx [[buffer(0)]], const device bfloat* cache [[buffer(1)]], const device bfloat* w [[buffer(2)]],
+                  const device int* prv [[buffer(3)]], device float* y [[buffer(4)]], constant SArgs& a [[buffer(5)]],
+                  uint2 g [[thread_position_in_grid]]) {
+    int c = int(g.x), r = int(g.y);
+    if (c >= D) return;
+    int rr = r < a.n ? r : 0;  // padded rows repeat row 0; their output is never read
+    int s1 = prv[rr * 2], s2 = prv[rr * 2 + 1];
+    float x0 = float(cache[long(a.p0 + rr) * D + c]);
+    float x1 = s1 >= 0 ? float(cache[long(s1) * D + c]) : 0.0f;
+    float x2 = s2 >= 0 ? float(cache[long(s2) * D + c]) : 0.0f;
+    float acc = fma(float(w[c * 3 + 2]), x0, fma(float(w[c * 3 + 1]), x1, float(w[c * 3]) * x2));
+    y[long(r) * D + c] = bcx[long(rr) * 3 * D + D + c] * acc;
+}
+"#;
