@@ -4,17 +4,24 @@
 
 pub const HEADER: &str = "#include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\n";
 
-/// Embedding lookup from MLX 4-bit affine (group 64) rows, rounded to bf16 like MLX's dequantize, times ESCALE
-/// (Gemma scales its embeddings). Defines: D, ESCALE.
+/// Embedding lookup from MLX 4- or 6-bit affine (group 64) rows, rounded to bf16 like MLX's dequantize, times ESCALE
+/// (Gemma scales its embeddings). Defines: D, ESCALE, BITS (default 4).
 pub const EMBED: &str = r#"
+#ifndef BITS
+#define BITS 4
+#endif
 kernel void embed(const device int* ids [[buffer(0)]], const device uint* w [[buffer(1)]],
                   const device bfloat* s [[buffer(2)]], const device bfloat* b [[buffer(3)]],
                   device float* h [[buffer(4)]], uint2 gid [[thread_position_in_grid]]) {
     uint c = gid.x, r = gid.y;
     if (c >= D) return;
     long t = ids[r];
-    uint word = w[t * (D / 8) + c / 8];
-    float q = float((word >> (4 * (c % 8))) & 0xFu);
+    const uint RW = D * BITS / 32;
+    uint bit = c * BITS, sh = bit % 32;
+    const device uint* wr = w + t * RW + bit / 32;
+    uint qi = wr[0] >> sh;
+    if (sh + BITS > 32) qi |= wr[1] << (32 - sh);
+    float q = float(qi & ((1u << BITS) - 1));
     float v = float(s[t * (D / 64) + c / 64]) * q + float(b[t * (D / 64) + c / 64]);
     h[r * D + c] = float(bfloat(v)) * ESCALE;
 }
@@ -106,11 +113,13 @@ kernel void swiglu_prep(const device float* gu [[buffer(0)]], device half* xh [[
 "#;
 
 /// v7 check matmul (see fast/qmma7.py): out[M, N] (+)= x[M, K] . W^T (times rs[m] when RS: the row's input scale).
-/// Defines: M, MT, K, N, NT, SK, ADD, RS.
+/// BITS 6: wh carries each weight's top 2 bits (lane word: bits 2*(ks*2+h)); they go into the half's mantissa above the
+/// nibble, so a weight decodes to the same offset (1024 or 64) + q as 4-bit and the group sums are unchanged.
+/// Defines: M, MT, K, N, NT, SK, ADD, RS, BITS.
 pub const QMM: &str = r#"
 kernel void qmm(const device half* x [[buffer(0)]], const device float* xoff [[buffer(1)]], const device float* xs [[buffer(2)]],
                 const device uint2* wq [[buffer(3)]], const device bfloat* sp [[buffer(4)]], const device bfloat* bp [[buffer(5)]],
-                device float* out [[buffer(6)]], const device float* rs [[buffer(7)]],
+                device float* out [[buffer(6)]], const device float* rs [[buffer(7)]], const device uint* wh [[buffer(8)]],
                 uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                 uint tg [[threadgroup_position_in_grid]]) {
     const int NGRP = K / 64;
@@ -128,6 +137,10 @@ kernel void qmm(const device half* x [[buffer(0)]], const device float* xoff [[b
         for (int g = int(sg); g < NGRP; g += SK) {
             uint2 wv[NT];
             _Pragma("unroll") for (int nt = 0; nt < NT; nt++) wv[nt] = wq[((t0 + nt) * NGRP + g) * 32 + lane];
+#if BITS == 6
+            uint hv6[NT];
+            _Pragma("unroll") for (int nt = 0; nt < NT; nt++) hv6[nt] = wh[((t0 + nt) * NGRP + g) * 32 + lane];
+#endif
             simdgroup_float8x8 T[NT];
             _Pragma("unroll") for (int nt = 0; nt < NT; nt++) T[nt] = simdgroup_float8x8(0);
             _Pragma("unroll") for (int ks = 0; ks < 8; ks++) {
@@ -138,6 +151,11 @@ kernel void qmm(const device half* x [[buffer(0)]], const device float* xoff [[b
                     const int j = ks & 3;
                     if (j >= 2) w = w >> 8;
                     uint bits = (j & 1) ? ((w & 0x00F000F0u) | 0x54005400u) : ((w & 0x000F000Fu) | 0x64006400u);
+#if BITS == 6
+                    uint h4 = (hv6[nt] >> (4 * ks)) & 0xFu;
+                    uint hx = (h4 & 3u) | ((h4 >> 2) << 16);
+                    bits |= hx << ((j & 1) ? 8 : 4);
+#endif
                     half2 hv = as_type<half2>(bits);
                     simdgroup_half8x8 B;
                     B.thread_elements()[0] = hv.x;

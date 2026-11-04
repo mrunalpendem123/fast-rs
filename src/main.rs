@@ -113,6 +113,7 @@ fn sz(w: usize) -> MTLSize {
 /// A 4-bit weight matrix in the v7 lane-native layout.
 struct QW {
     wq: Buf,
+    wh: Option<Buf>, // 6-bit models: the top 2 bits of each weight, one u32 per (tile, group, lane)
     sp: Buf,
     bp: Buf,
     n: usize,
@@ -122,8 +123,10 @@ struct QW {
 const FM: [usize; 32] = { let mut a = [0; 32]; let mut l = 0; while l < 32 { let q = l / 4; a[l] = (q & 4) + ((l / 2) % 4); l += 1; } a };
 const FN: [usize; 32] = { let mut a = [0; 32]; let mut l = 0; while l < 32 { let q = l / 4; a[l] = (q & 2) * 2 + (l % 2) * 2; l += 1; } a };
 
-/// One matrix in MLX 4-bit layout (w [N, K/8] u32, s/b [N, K/64] bf16 bits), borrowed or owned.
+/// One matrix in MLX 4- or 6-bit layout (w [N, K*bits/32] u32 little-endian bitstream, s/b [N, K/64] bf16 bits),
+/// borrowed or owned.
 struct Q4<'a> {
+    bits: usize,
     w: std::borrow::Cow<'a, [u32]>,
     s: std::borrow::Cow<'a, [u16]>,
     b: std::borrow::Cow<'a, [u16]>,
@@ -215,9 +218,11 @@ fn padded(n: usize) -> usize {
 /// Several matrices stacked by rows -> v7 layout. Row tiles are independent, so they are split across all cores.
 fn repack(gpu: &Gpu, parts: &[Q4], k: usize) -> QW {
     let g_n = k / 64;
-    let kw = k / 8;
     let n: usize = parts.iter().map(|p| p.rows).sum();
-    let sizes = [n / 8 * g_n * 32 * 2 * 4, n / 8 * g_n * 8 * 2, n / 8 * g_n * 8 * 2];
+    let bits = parts[0].bits;
+    assert!(parts.iter().all(|p| p.bits == bits));
+    let mut sizes = vec![n / 8 * g_n * 32 * 2 * 4, n / 8 * g_n * 8 * 2, n / 8 * g_n * 8 * 2];
+    if bits == 6 { sizes.push(n / 8 * g_n * 32 * 4); }
     let cached = WCACHE.with(|c| {
         let mut c = c.borrow_mut();
         let Some(WCache::Read { map, off }) = &mut *c else { return None };
@@ -233,35 +238,48 @@ fn repack(gpu: &Gpu, parts: &[Q4], k: usize) -> QW {
         Some(bufs)
     });
     if let Some(mut b) = cached {
+        let wh = if bits == 6 { b.pop() } else { None };
         let (bp, sp, wq) = (b.pop().unwrap(), b.pop().unwrap(), b.pop().unwrap());
-        return QW { wq, sp, bp, n, k };
+        return QW { wq, wh, sp, bp, n, k };
     }
     let mut wq = vec![0u32; n / 8 * g_n * 32 * 2];
     let mut sp = vec![0u16; n / 8 * g_n * 8];
     let mut bp = vec![0u16; n / 8 * g_n * 8];
+    let mut wh = vec![0u32; if bits == 6 { n / 8 * g_n * 32 } else { 0 }];
     // tile t -> (part, tile within part)
     let mut owner = Vec::with_capacity(n / 8);
     for (pi, part) in parts.iter().enumerate() {
         for tl in 0..part.rows / 8 { owner.push((pi, tl)); }
     }
-    let tile = |t: usize, wq: &mut [u32], sp: &mut [u16], bp: &mut [u16]| {
+    let rw = k * bits / 32; // u32 words per row
+    // weight (row r, column c) from the little-endian bitstream
+    let qat = |w: &[u32], r: usize, c: usize| -> u32 {
+        let bit = r * rw * 32 + c * bits;
+        let (i, sh) = (bit / 32, bit % 32);
+        let v = if sh + bits > 32 { (w[i] >> sh) | (w[i + 1] << (32 - sh)) } else { w[i] >> sh };
+        v & ((1 << bits) - 1)
+    };
+    let tile = |t: usize, wq: &mut [u32], wh: &mut [u32], sp: &mut [u16], bp: &mut [u16]| {
         let (pi, tl) = owner[t];
         let (w, s, b) = (&parts[pi].w, &parts[pi].s, &parts[pi].b);
         for g in 0..g_n {
             for lane in 0..32 {
                 let (fm, fnn) = (FM[lane], FN[lane]);
+                let mut hi = 0u32;
                 for word in 0..2 {
                     let mut v = 0u32;
                     for half_ in 0..2 {
                         let r = tl * 8 + fnn + half_;
                         for i in 0..4 {
                             let ks = word * 4 + i;
-                            let q = (w[r * kw + g * 8 + ks] >> (4 * fm)) & 0xF;
-                            v |= q << (4 * i + 16 * half_);
+                            let q = qat(w, r, g * 64 + ks * 8 + fm);
+                            v |= (q & 0xF) << (4 * i + 16 * half_);
+                            hi |= (q >> 4) << (2 * (ks * 2 + half_));
                         }
                     }
                     wq[(g * 32 + lane) * 2 + word] = v;
                 }
+                if bits == 6 { wh[g * 32 + lane] = hi; }
             }
             for r in 0..8 {
                 sp[g * 8 + r] = s[(tl * 8 + r) * g_n + g];
@@ -273,18 +291,21 @@ fn repack(gpu: &Gpu, parts: &[Q4], k: usize) -> QW {
     let threads = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(8).min(tiles.max(1));
     let per = tiles.div_ceil(threads);
     std::thread::scope(|sc| {
-        let (mut wr, mut sr, mut br) = (&mut wq[..], &mut sp[..], &mut bp[..]);
+        let hn = if bits == 6 { g_n * 32 } else { 0 };
+        let (mut wr, mut hr, mut sr, mut br) = (&mut wq[..], &mut wh[..], &mut sp[..], &mut bp[..]);
         let mut t0 = 0;
         while t0 < tiles {
             let cnt = per.min(tiles - t0);
             let (w1, w2) = std::mem::take(&mut wr).split_at_mut(cnt * g_n * 64);
+            let (h1, h2) = std::mem::take(&mut hr).split_at_mut(cnt * hn);
             let (s1, s2) = std::mem::take(&mut sr).split_at_mut(cnt * g_n * 8);
             let (b1, b2) = std::mem::take(&mut br).split_at_mut(cnt * g_n * 8);
-            (wr, sr, br) = (w2, s2, b2);
+            (wr, hr, sr, br) = (w2, h2, s2, b2);
             let tile = &tile;
             sc.spawn(move || {
                 for i in 0..cnt {
-                    tile(t0 + i, &mut w1[i * g_n * 64..(i + 1) * g_n * 64], &mut s1[i * g_n * 8..(i + 1) * g_n * 8], &mut b1[i * g_n * 8..(i + 1) * g_n * 8]);
+                    tile(t0 + i, &mut w1[i * g_n * 64..(i + 1) * g_n * 64], &mut h1[i * hn..(i + 1) * hn],
+                         &mut s1[i * g_n * 8..(i + 1) * g_n * 8], &mut b1[i * g_n * 8..(i + 1) * g_n * 8]);
                 }
             });
             t0 += cnt;
@@ -301,13 +322,15 @@ fn repack(gpu: &Gpu, parts: &[Q4], k: usize) -> QW {
                 Ok(())
             };
             put(wq.as_ptr() as *const u8, sizes[0]).and_then(|_| put(sp.as_ptr() as *const u8, sizes[1]))
-                .and_then(|_| put(bp.as_ptr() as *const u8, sizes[2])).is_err()
+                .and_then(|_| put(bp.as_ptr() as *const u8, sizes[2]))
+                .and_then(|_| if bits == 6 { put(wh.as_ptr() as *const u8, sizes[3]) } else { Ok(()) }).is_err()
         } else { false };
         if failed {
             if let Some(WCache::Write { tmp, .. }) = c.take() { let _ = std::fs::remove_file(tmp); } // e.g. disk full: just don't cache
         }
     });
-    QW { wq: gpu.buf_from(&wq), sp: gpu.buf_from(&sp), bp: gpu.buf_from(&bp), n, k }
+    let wh = if bits == 6 { Some(gpu.buf_from(&wh)) } else { None };
+    QW { wq: gpu.buf_from(&wq), wh, sp: gpu.buf_from(&sp), bp: gpu.buf_from(&bp), n, k }
 }
 
 fn bf16_to_f32(x: u16) -> f32 {
@@ -340,7 +363,7 @@ fn quant4(src: &[u16], rows: usize, k: usize) -> Q4<'static> {
             }
         }
     }
-    Q4 { w: w.into(), s: s.into(), b: b.into(), rows }
+    Q4 { bits: 4, w: w.into(), s: s.into(), b: b.into(), rows }
 }
 
 struct Layer {
@@ -464,6 +487,7 @@ struct Stack {
 struct Weights {
     idx: HashMap<String, st::TensorInfo>,
     maps: HashMap<std::path::PathBuf, memmap2::Mmap>,
+    bits: usize, // of the already-quantized matrices (config.json quantization.bits)
 }
 
 impl Weights {
@@ -476,7 +500,10 @@ impl Weights {
                 maps.insert(t.file.clone(), unsafe { memmap2::Mmap::map(&f)? });
             }
         }
-        Ok(Weights { idx, maps })
+        let bits = std::fs::read_to_string(dir.join("config.json")).ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|c| c["quantization"]["bits"].as_u64()).unwrap_or(4) as usize;
+        Ok(Weights { idx, maps, bits })
     }
     fn raw(&self, name: &str) -> Result<&[u8]> {
         let t = self.idx.get(name).with_context(|| format!("missing {name}"))?;
@@ -501,10 +528,11 @@ impl Weights {
     fn q4(&self, name: &str) -> Result<Q4<'_>> {
         if wcache_reading() {
             // only the row count is needed: repack() takes the matrix from the cache file
-            return Ok(Q4 { w: Vec::new().into(), s: Vec::new().into(), b: Vec::new().into(), rows: self.shape(&format!("{name}.weight"))[0] });
+            let bits = if self.idx.contains_key(&format!("{name}.scales")) { self.bits } else { 4 };
+            return Ok(Q4 { bits, w: Vec::new().into(), s: Vec::new().into(), b: Vec::new().into(), rows: self.shape(&format!("{name}.weight"))[0] });
         }
         if self.idx.contains_key(&format!("{name}.scales")) {
-            Ok(Q4 { w: self.u32s(&format!("{name}.weight"))?.into(), s: self.u16s(&format!("{name}.scales"))?.into(),
+            Ok(Q4 { bits: self.bits, w: self.u32s(&format!("{name}.weight"))?.into(), s: self.u16s(&format!("{name}.scales"))?.into(),
                     b: self.u16s(&format!("{name}.biases"))?.into(), rows: self.shape(&format!("{name}.weight"))[0] })
         } else {
             let sh = self.shape(&format!("{name}.weight"));
@@ -764,8 +792,8 @@ impl Model {
     fn load_inner(dir: &Path, guesser: Option<&Path>, maxlen: usize) -> Result<Self> {
         let gpu = Gpu::new()?;
         let c: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
-        if c["quantization"]["bits"].as_i64() != Some(4) || c["quantization"]["group_size"].as_i64() != Some(64) {
-            bail!("only MLX 4-bit group-64 models for now");
+        if !matches!(c["quantization"]["bits"].as_i64(), Some(4 | 6)) || c["quantization"]["group_size"].as_i64() != Some(64) {
+            bail!("only MLX 4- or 6-bit group-64 models for now");
         }
         let cfg = read_cfg(&c);
         let tc = if c["text_config"].is_object() { &c["text_config"] } else { &c };
@@ -827,7 +855,7 @@ impl Model {
         let partw = all.iter().map(|l| l.at.h * (l.at.hd + 2)).max().unwrap_or(0);
         let (tmp, tmp2, rsb) = (gpu.buf(r * cfg.d * 4), gpu.buf(r * ple.max(64) * 4), gpu.buf(r * 4));
         Ok(Model {
-            emb_w: gpu.buf(r * cfg.d / 2),
+            emb_w: gpu.buf(r * cfg.d * w.bits / 8),
             emb_s: gpu.buf(r * cfg.d / 64 * 2),
             emb_b: gpu.buf(r * cfg.d / 64 * 2),
             emb_ids: gpu.buf_from(&(0..r as i32).collect::<Vec<_>>()),
@@ -980,7 +1008,8 @@ impl Model {
                 for add in [false, true] {
                     let (nt, sk) = self.cfg_for(w.n, w.k, rows / 8);
                     self.gpu.pipe("qmm", kernels::QMM, &[("M", rows.to_string()), ("MT", (rows / 8).to_string()), ("K", w.k.to_string()),
-                        ("N", w.n.to_string()), ("NT", nt.to_string()), ("SK", sk.to_string()), ("ADD", (add as i32).to_string()), ("RS", "0".into())])?;
+                        ("N", w.n.to_string()), ("NT", nt.to_string()), ("SK", sk.to_string()), ("ADD", (add as i32).to_string()), ("RS", "0".into()),
+                        ("BITS", if w.wh.is_some() { "6" } else { "4" }.into())])?;
                 }
             }
         }
@@ -1072,9 +1101,10 @@ impl Model {
         let mt = rows / 8;
         let rs = std::mem::take(&mut self.rs_next);
         let p = self.gpu.pipe("qmm", kernels::QMM, &[("M", rows.to_string()), ("MT", mt.to_string()), ("K", w.k.to_string()),
-            ("N", w.n.to_string()), ("NT", nt.to_string()), ("SK", sk.to_string()), ("ADD", (add as i32).to_string()), ("RS", (rs as i32).to_string())])?;
+            ("N", w.n.to_string()), ("NT", nt.to_string()), ("SK", sk.to_string()), ("ADD", (add as i32).to_string()), ("RS", (rs as i32).to_string()),
+            ("BITS", if w.wh.is_some() { "6" } else { "4" }.into())])?;
         e.setComputePipelineState(&p);
-        bind(e, &[x[0], x[1], x[2], &w.wq, &w.sp, &w.bp, out, &self.rscale]);
+        bind(e, &[x[0], x[1], x[2], &w.wq, &w.sp, &w.bp, out, &self.rscale, w.wh.as_ref().unwrap_or(&w.wq)]);
         if r0 > 0 {
             unsafe {
                 e.setBuffer_offset_atIndex(Some(x[0]), r0 * w.k * 2, 0);
@@ -1112,13 +1142,13 @@ impl Model {
 
     fn enc_embed(&mut self, e: &Enc, d: usize, n: usize) -> Result<()> {
         let escale = self.t.cfg.gemma.as_ref().map(|_| (d as f32).sqrt()).unwrap_or(1.0);
-        let p = self.gpu.pipe("embed", kernels::EMBED, &[("D", d.to_string()), ("ESCALE", format!("{escale:e}f"))])?;
+        let p = self.gpu.pipe("embed", kernels::EMBED, &[("D", d.to_string()), ("ESCALE", format!("{escale:e}f")), ("BITS", self.emb.bits.to_string())])?;
         e.setComputePipelineState(&p);
         let ids: Vec<i32> = read(&self.ids, n);
         let ep = &self.epre;
         let (tw, ts, tb) = (self.emb.u32s(&format!("{ep}.weight"))?, self.emb.u16s(&format!("{ep}.scales"))?,
                             self.emb.u16s(&format!("{ep}.biases"))?);
-        let (rw, rs) = (d / 8, d / 64);
+        let (rw, rs) = (d * self.emb.bits / 32, d / 64);
         let gather = |t: &[u16]| -> Vec<u16> { ids.iter().flat_map(|&i| t[i as usize * rs..(i as usize + 1) * rs].iter().copied()).collect() };
         write(&self.emb_w, &ids.iter().flat_map(|&i| tw[i as usize * rw..(i as usize + 1) * rw].iter().copied()).collect::<Vec<u32>>());
         write(&self.emb_s, &gather(ts));
