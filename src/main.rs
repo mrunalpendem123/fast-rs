@@ -1781,6 +1781,9 @@ impl Model {
     /// Exact tree decoding; `on_words` gets each pass's new words (return false to stop). Returns (seconds, passes).
     pub fn generate(&mut self, prompt: &[i32], max_new: usize, eos: &[i32], budget: usize,
                     on_words: &mut dyn FnMut(&[i32]) -> bool) -> Result<(f64, usize)> {
+        // tree rows' ancestor lists and the per-row buffers hold MAXD entries: a bigger tree overflows them and
+        // silently breaks exactness for this and later calls
+        anyhow::ensure!(budget >= 1 && budget <= MAXD, "tree budget {budget} not supported (1..={MAXD})");
         let mut keep = if self.reuse { self.shared_prefix(prompt) } else { 0 };
         let hybrid = self.t.cfg.lin.is_some();
         if hybrid && keep != self.hist.len() {
