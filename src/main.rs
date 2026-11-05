@@ -699,6 +699,7 @@ struct Guesser {
     target_layers: Vec<usize>,
     mask: i32,
     block: usize,
+    run_block: usize,        // block drafted per pass (≤ block): fewer positions cost less and a tree of 8 rarely uses more
     c: usize,                // context words already in the guesser's memory
     pending: Vec<f32>,       // target features of committed words not yet in its memory [rows, F]
     markov: Option<Weights>, // DSpark: low-rank bigram bias w1[prev] . w2[next] added to each drafted position
@@ -822,11 +823,16 @@ impl Model {
                     .iter().map(|x| x.as_u64().unwrap() as usize).collect();
                 let stack = load_stack(&gpu, &gw, &gcfg, gc["num_hidden_layers"].as_u64().unwrap() as usize, "", "norm.weight", maxlen, true)?;
                 let has_markov = gw.idx.contains_key("markov_head.markov_w1.weight");
+                let block = gc["block_size"].as_u64().or(gc["dflash_config"]["block_size"].as_u64()).context("block_size")? as usize;
+                // Qwen3.5-4B + z-lab DFlash: block 8 keeps acceptance and drafts in ~2/3 the time (Spec-Bench dev 60:
+                // 1.18-1.33x, outputs identical); Qwen3-4B loses acceptance at 8, so it keeps the trained block.
+                let run_block = if c["model_type"].as_str() == Some("qwen3_5") && !has_markov { block.min(8) } else { block };
                 Some(Guesser {
                     fc: repack(&gpu, &[gw.q4("fc")?], tl.len() * gcfg.d),
                     hidden_norm: gpu.buf_from(gw.u16s("hidden_norm.weight")?),
                     mask: gc["dflash_config"]["mask_token_id"].as_i64().unwrap() as i32,
-                    block: gc["block_size"].as_u64().or(gc["dflash_config"]["block_size"].as_u64()).context("block_size")? as usize,
+                    block,
+                    run_block,
                     target_layers: tl,
                     stack,
                     c: 0,
@@ -1467,7 +1473,7 @@ impl Model {
             done += a;
         }
         // block: [root, mask x (B-1)] at positions c.., every block row sees the whole context and the whole block
-        let b = std::env::var("DFLASH_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(g.block).min(g.block);
+        let b = std::env::var("DFLASH_BLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(g.run_block).min(g.block);
         let ids: Vec<i32> = std::iter::once(root).chain(std::iter::repeat(g.mask).take(b - 1)).collect();
         let pos: Vec<i32> = (0..b).map(|j| (g.c + j) as i32).collect();
         let rows: Vec<[i32; 4]> = pos.iter().map(|&p| [p, g.c as i32, b as i32, 0]).collect();
