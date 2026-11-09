@@ -581,6 +581,14 @@ function renderMenu() {
     b.addEventListener("click", () => { model = id; if (cur) cur.model = id; closeMenu(); syncPicker(); if (cur && !cur.messages.length) renderThread(); toast(status.loaded === id ? `${info.name} is ready` : `${info.name} loads with your next message`); });
     m.appendChild(b);
   });
+  if (document.body.classList.contains("app")) {
+    // in the Mac app: open its Models page (the app intercepts fastrs://models; nothing else can use that link)
+    const g = document.createElement("button");
+    g.type = "button"; g.className = "opt";
+    g.innerHTML = `<span class="n">+</span><span><b>Get more models…</b><small>Download Qwen, Gemma or LFM · or remove ones you don't use</small></span><em></em>`;
+    g.addEventListener("click", () => { closeMenu(); location.href = "fastrs://models"; });
+    m.appendChild(g);
+  }
 }
 function closeMenu() { $("menu").hidden = true; $("pick").setAttribute("aria-expanded", "false"); }
 $("pick").addEventListener("click", e => { e.stopPropagation(); const m = $("menu"); if (m.hidden) { renderMenu(); m.hidden = false; $("pick").setAttribute("aria-expanded", "true"); } else closeMenu(); });
