@@ -4,9 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>fast-rs</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600&family=Geist+Mono:wght@400;500&family=Newsreader:opsz,wght@6..72,300;6..72,400&display=swap">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'none'">
+<link rel="stylesheet" href="/assets/fonts.css">
 <style>
 /* Layout: blueprint sheets. A rail of chats, a centred thread set like a technical document, an engine inspector.
    Tokens follow the fast-rs website: paper, ink, one cobalt accent, signal orange/leaf for state. */
@@ -630,10 +629,10 @@ const spark = {pts: [], draw() {
 const TEXT_EXT = /\.(txt|md|markdown|py|js|mjs|ts|tsx|jsx|json|csv|tsv|html|htm|css|rs|go|java|c|h|cpp|hpp|cs|rb|php|swift|kt|sh|zsh|yaml|yml|toml|ini|xml|sql|log|tex|r|scala|lua|pl|vue|svelte|ipynb)$/i;
 async function readPdf(file) {
   if (!window.pdfjsLib) {
-    await new Promise((ok, bad) => { const s = document.createElement("script"); s.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"; s.onload = ok; s.onerror = () => bad(new Error("Reading PDFs needs the internet the first time")); document.head.appendChild(s); });
-    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+    await new Promise((ok, bad) => { const s = document.createElement("script"); s.src = "/assets/pdf.min.js"; s.onload = ok; s.onerror = () => bad(new Error("Could not load the PDF reader")); document.head.appendChild(s); });
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "/assets/pdf.worker.min.js";
   }
-  const pdf = await pdfjsLib.getDocument({data: await file.arrayBuffer()}).promise; let out = "";
+  const pdf = await pdfjsLib.getDocument({data: await file.arrayBuffer(), isEvalSupported: false}).promise; let out = "";
   for (let p = 1; p <= pdf.numPages && out.length < fileBudget() * 2; p++) { const tc = await (await pdf.getPage(p)).getTextContent(); out += tc.items.map(i => i.str).join(" ") + "\n\n"; }
   return out;
 }

@@ -337,6 +337,47 @@ impl Sse {
     }
 }
 
+/// Files the chat page needs, built into the binary so the app works offline and loads nothing from the internet.
+const ASSETS: &[(&str, &[u8], &str)] = &[
+    ("fonts.css", include_bytes!("../assets/fonts.css"), "text/css; charset=utf-8"),
+    ("geist-latin.woff2", include_bytes!("../assets/geist-latin.woff2"), "font/woff2"),
+    ("geist-latin-ext.woff2", include_bytes!("../assets/geist-latin-ext.woff2"), "font/woff2"),
+    ("geistmono-latin.woff2", include_bytes!("../assets/geistmono-latin.woff2"), "font/woff2"),
+    ("geistmono-latin-ext.woff2", include_bytes!("../assets/geistmono-latin-ext.woff2"), "font/woff2"),
+    ("newsreader-latin.woff2", include_bytes!("../assets/newsreader-latin.woff2"), "font/woff2"),
+    ("newsreader-latin-ext.woff2", include_bytes!("../assets/newsreader-latin-ext.woff2"), "font/woff2"),
+    ("pdf.min.js", include_bytes!("../assets/pdf.min.js"), "text/javascript; charset=utf-8"),
+    ("pdf.worker.min.js", include_bytes!("../assets/pdf.worker.min.js"), "text/javascript; charset=utf-8"),
+];
+
+/// Largest request body read (a chat with attached files); anything longer is cut off.
+const MAX_BODY: u64 = 64 << 20;
+
+/// The engine listens on 127.0.0.1 only, but a web page in any browser on this Mac could still send it requests.
+/// Two checks stop that: the Host header must name this machine (defeats DNS rebinding), and a browser request
+/// must come from the engine's own page (browsers always send Origin on cross-site POSTs). Apps that call the API
+/// from their own process (Open WebUI's server, curl, SDKs) send no Origin and are allowed.
+/// More origins can be allowed with FASTRS_ALLOWED_ORIGINS="http://localhost:3000,...".
+fn local_only(req: &tiny_http::Request, port: u16) -> bool {
+    let hdr = |name: &str| req.headers().iter().find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name)).map(|h| h.value.as_str().to_string());
+    let host_ok = match hdr("Host") {
+        Some(h) => {
+            let h = h.to_ascii_lowercase();
+            ["127.0.0.1", "localhost", "[::1]"].iter().any(|n| h == *n || h == format!("{n}:{port}"))
+        }
+        None => true, // HTTP/1.0 clients may omit it; they are not browsers
+    };
+    let origin_ok = match hdr("Origin") {
+        None => true,
+        Some(o) => {
+            let o = o.trim_end_matches('/').to_ascii_lowercase();
+            o == format!("http://127.0.0.1:{port}") || o == format!("http://localhost:{port}")
+                || std::env::var("FASTRS_ALLOWED_ORIGINS").map(|v| v.split(',').any(|a| a.trim().trim_end_matches('/').eq_ignore_ascii_case(&o))).unwrap_or(false)
+        }
+    };
+    host_ok && origin_ok
+}
+
 fn json_resp(req: tiny_http::Request, v: Value, code: u16) {
     let h = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
     let _ = req.respond(tiny_http::Response::from_string(v.to_string()).with_status_code(code).with_header(h));
@@ -370,8 +411,20 @@ pub fn run(model: String, guesser: Option<String>, port: u16) -> Result<()> {
     let server = tiny_http::Server::http(("127.0.0.1", port)).map_err(|e| anyhow!("{e}"))?;
     eprintln!("ready: {} on http://127.0.0.1:{port}/v1 (loaded: {id})", ids.join(", "));
     for mut req in server.incoming_requests() {
+        if !local_only(&req, port) {
+            json_resp(req, json!({"error": "forbidden: only this Mac's own pages and apps may use the engine"}), 403);
+            continue;
+        }
         let path = req.url().split('?').next().unwrap_or("").trim_end_matches('/').to_string();
         match (req.method().as_str(), path.as_str()) {
+            ("GET", p) if p.starts_with("/assets/") => match ASSETS.iter().find(|(n, _, _)| p == format!("/assets/{n}")) {
+                Some((_, body, mime)) => {
+                    let h = tiny_http::Header::from_bytes(&b"Content-Type"[..], mime.as_bytes()).unwrap();
+                    let c = tiny_http::Header::from_bytes(&b"Cache-Control"[..], &b"max-age=86400"[..]).unwrap();
+                    let _ = req.respond(tiny_http::Response::from_data(*body).with_header(h).with_header(c));
+                }
+                None => json_resp(req, json!({"error": "not found"}), 404),
+            },
             ("GET", "") | ("GET", "/index.html") => {
                 let h = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
                 let _ = req.respond(tiny_http::Response::from_string(include_str!("chat.html")).with_header(h));
@@ -382,7 +435,7 @@ pub fn run(model: String, guesser: Option<String>, port: u16) -> Result<()> {
             }
             ("POST", p) if p.ends_with("/chat/completions") => {
                 let mut body = String::new();
-                let _ = req.as_reader().read_to_string(&mut body);
+                let _ = req.as_reader().take(MAX_BODY).read_to_string(&mut body);
                 let b: Value = serde_json::from_str(&body).unwrap_or(json!({}));
                 let (otx, orx) = channel();
                 let want = b["model"].as_str().unwrap_or(&id).to_string();
