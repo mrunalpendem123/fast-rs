@@ -2242,7 +2242,7 @@ fn specbench(a: &[String]) -> Result<()> {
         }
     }
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
-    println!("Spec-Bench (Qwen3-4B 4-bit + DFlash tree {budget}, greedy, max {max_new} new tokens/turn, wall time incl. prompt reading)");
+    println!("Spec-Bench ({} + {} tree {budget}, greedy, max {max_new} new tokens/turn, wall time incl. prompt reading)", model.file_name().unwrap_or_default().to_string_lossy(), guesser.as_deref().and_then(|g| g.file_name()).map(|g| g.to_string_lossy().to_string()).unwrap_or("no guesser".into()));
     println!("{:16} {:>9} {:>12} {:>11} {:>8} {:>13} {:>10}", "category", "questions", "baseline t/s", "method t/s", "speedup", "mean accepted", "identical");
     let mut all = Vec::new();
     for (cat, v) in &cats {
