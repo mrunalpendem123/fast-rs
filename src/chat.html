@@ -281,6 +281,7 @@ body.app .ins { padding-top: 44px; }
 .toast.on { opacity: 1; transform: translateX(-50%); }
 @media (max-width: 1100px) { body.insp { grid-template-columns: 268px minmax(0, 1fr) 0; } }
 @media (max-width: 760px) { body, body.insp { grid-template-columns: 0 minmax(0, 1fr) 0; } aside.rail { display: none; } .sugg { grid-template-columns: 1fr; } .thread { padding: 24px 18px; } .sheet { padding-left: 0; } .holes { display: none; } }
+.benchlink { display: none; margin-top: 8px; color: var(--cobalt, #2337e6); text-decoration: none; } body.app .benchlink { display: block; }
 </style>
 </head>
 <body>
@@ -293,6 +294,7 @@ body.app .ins { padding-top: 44px; }
     <div class="row"><span class="dot warn" id="edot"></span><span id="etext">Connecting to the engine…</span></div>
     <div class="meter" title="GPU memory in use, of the 5.73 GB this Mac allows"><i id="emem" style="width:0"></i></div>
     <div class="label" id="ememt">GPU memory —</div>
+    <a class="label benchlink" href="fastrs://bench">Benchmark this Mac →</a>
   </div>
 </aside>
 
@@ -588,6 +590,11 @@ function renderMenu() {
     g.innerHTML = `<span class="n">+</span><span><b>Get more models…</b><small>Download Qwen, Gemma or LFM · or remove ones you don't use</small></span><em></em>`;
     g.addEventListener("click", () => { closeMenu(); location.href = "fastrs://models"; });
     m.appendChild(g);
+    const k = document.createElement("button");
+    k.type = "button"; k.className = "opt";
+    k.innerHTML = `<span class="n">⏱</span><span><b>Benchmark this Mac…</b><small>Measure the speedup on your Mac and share it · about 10–20 min</small></span><em></em>`;
+    k.addEventListener("click", () => { closeMenu(); location.href = "fastrs://bench"; });
+    m.appendChild(k);
   }
 }
 function closeMenu() { $("menu").hidden = true; $("pick").setAttribute("aria-expanded", "false"); }
