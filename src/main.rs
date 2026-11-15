@@ -2172,12 +2172,7 @@ fn specbench(a: &[String]) -> Result<()> {
     minijinja_contrib::add_to_environment(&mut env);
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_template_owned("chat", server::template(&model)?)?;
-    let mut eos: Vec<i32> = Vec::new();
-    for t in ["<|im_end|>", "<|endoftext|>"] {
-        if let Some(id) = tok.token_to_id(t) {
-            eos.push(id as i32);
-        }
-    }
+    let eos = server::eos_ids(&model, &tok)?;
     let maxlen = 6144;
     let mut m = Model::load(&model, guesser.as_deref(), maxlen)?;
     m.autotune()?;
@@ -2271,7 +2266,7 @@ fn prefixtest(a: &[String]) -> Result<()> {
     minijinja_contrib::add_to_environment(&mut env);
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_template_owned("chat", server::template(&model)?)?;
-    let eos: Vec<i32> = ["<|im_end|>", "<|endoftext|>"].iter().filter_map(|t| tok.token_to_id(t)).map(|x| x as i32).collect();
+    let eos = server::eos_ids(&model, &tok)?;
     let mut m = Model::load(&model, guesser.as_deref(), 6144)?;
     m.autotune()?;
     m.warm()?;

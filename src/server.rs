@@ -98,18 +98,7 @@ fn load(e: &Entry, ctx: usize) -> Result<Loaded> {
     minijinja_contrib::add_to_environment(&mut env);
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_template_owned("chat", src)?;
-    let cfg: Value = serde_json::from_str(&std::fs::read_to_string(e.model.join("config.json"))?)?;
-    let ecfg = if cfg["eos_token_id"].is_null() { &cfg["text_config"]["eos_token_id"] } else { &cfg["eos_token_id"] };
-    let mut eos: Vec<i32> = match ecfg {
-        Value::Array(v) => v.iter().filter_map(|x| x.as_i64()).map(|x| x as i32).collect(),
-        Value::Number(n) => vec![n.as_i64().unwrap() as i32],
-        _ => vec![],
-    };
-    for t in ["<|im_end|>", "<|endoftext|>", "<turn|>", "<end_of_turn>"] {
-        if let Some(id) = tok.token_to_id(t) {
-            eos.push(id as i32);
-        }
-    }
+    let eos = eos_ids(&e.model, &tok)?;
     let mut m = Model::load(&e.model, e.guesser.as_deref(), ctx)?;
     let t1 = Instant::now();
     m.autotune()?;
@@ -146,6 +135,23 @@ fn start_ctx(e: &Entry) -> usize {
 
 fn ctx_for(e: &Entry) -> usize {
     std::env::var("FAST_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(e.ctx)
+}
+
+/// End-of-turn tokens: the model config's eos_token_id(s) plus the chat end markers of every supported family.
+pub fn eos_ids(model: &std::path::Path, tok: &tokenizers::Tokenizer) -> Result<Vec<i32>> {
+    let cfg: Value = serde_json::from_str(&std::fs::read_to_string(model.join("config.json"))?)?;
+    let ecfg = if cfg["eos_token_id"].is_null() { &cfg["text_config"]["eos_token_id"] } else { &cfg["eos_token_id"] };
+    let mut eos: Vec<i32> = match ecfg {
+        Value::Array(v) => v.iter().filter_map(|x| x.as_i64()).map(|x| x as i32).collect(),
+        Value::Number(n) => vec![n.as_i64().unwrap() as i32],
+        _ => vec![],
+    };
+    for t in ["<|im_end|>", "<|endoftext|>", "<turn|>", "<end_of_turn>"] {
+        if let Some(id) = tok.token_to_id(t) {
+            eos.push(id as i32);
+        }
+    }
+    Ok(eos)
 }
 
 fn budget() -> usize {
