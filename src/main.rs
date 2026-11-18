@@ -1914,7 +1914,7 @@ fn main() -> Result<()> {
         let port: u16 = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(8800);
         return server::run(model, guesser, port);
     }
-    let dir = Path::new(a.get(1).map(|s| s.as_str()).unwrap_or("/Users/mrunalpendem/models/qwen3-4b-4bit"));
+    let dir = Path::new(a.get(1).map(|s| s.as_str()).context("usage: fast-rs serve|specbench|bench|prefixtest ... (see README)")?);
     let prompts: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(a.get(2).context("prompts json")?)?)?;
     let max_new: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(128);
     let guesser = a.get(4).map(Path::new);

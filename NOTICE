@@ -1,0 +1,17 @@
+fast-rs
+Copyright 2026 mrunalpendem (github.com/mrunalpendem123)
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository bundles third-party material under its own licences:
+
+- data/specbench/question.jsonl: Spec-Bench questions, Copyright Heming Xia et al.,
+  Apache License 2.0. https://github.com/hemingkx/Spec-Bench
+- assets/pdf.min.js, assets/pdf.worker.min.js: PDF.js, Copyright Mozilla Foundation,
+  Apache License 2.0. https://github.com/mozilla/pdf.js
+- assets/geist*.woff2: Geist and Geist Mono fonts, Copyright Vercel,
+  SIL Open Font License 1.1. https://github.com/vercel/geist-font
+- assets/newsreader*.woff2: Newsreader font, Copyright Production Type,
+  SIL Open Font License 1.1. https://github.com/productiontype/Newsreader
+
+Model weights and drafters are NOT included. scripts/get-model.sh downloads them from
+Hugging Face; each keeps its own licence (see each model page).
