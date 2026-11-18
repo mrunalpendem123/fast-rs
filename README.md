@@ -29,7 +29,7 @@ fast-rs uses **batch-invariant 4-bit kernels**: every row is reduced in the same
 
 ## Limits
 
-- **Plain decoding is not faster than other engines.** Single-token decoding is limited by memory bandwidth for everyone. The gain comes only from speculation.
+- **Plain decoding is slower than MLX on this Mac** (~26 vs ~34 tok/s on Qwen3-4B 4-bit, measured differently: llama-bench-style tg128 vs mlx-lm decode). The gain comes only from speculation. With speculation on, fast-rs measured ~2× MLX's speed in a 4-prompt test on Qwen3.5-4B (62.5 vs 32.0 tok/s).
 - **The speedup depends on the task:** maths up to 3.57×, while RAG and summarization gain ~1.7× because ~30% of their time is spent reading the prompt.
 - **One machine so far.** Every number above comes from one M2 MacBook Pro. Results from other Macs are welcome.
 - Exactness means identical to **fast-rs's own** plain greedy decoding. Different engines (MLX, llama.cpp) can differ from each other at near-ties because their kernels round differently.
